@@ -81,6 +81,22 @@ const __ssSave = async (c, data, generation, barrier, saveId, deadlineMs = 45000
 `;
 
 /** Rechecks the captured save in the same renderer turn that closes its editor. */
+// Closing the window can destroy the page context before the script's result is delivered, which loses the
+// reply ("Promise was collected"). The window closes on a timer so the result goes out first. The busy
+// barrier is held until then, and a project edited by hand in the meantime is left open.
+const CLOSE_AFTER_REPLY = `
+      const closingGeneration = project.editGeneration;
+      setTimeout(() => {
+        try {
+          if (__ss.get(path) === c && c.project === project && project.editGeneration === closingGeneration) {
+            w.onbeforeunload = null;
+            w.close();
+          }
+        } finally {
+          if (__ss.busy()[path] === barrier) delete __ss.busy()[path];
+        }
+      }, 100);`;
+
 export function closeSavedScript(path: string, saveId: string) {
   return `
     const path = ${JSON.stringify(path)};
@@ -92,6 +108,7 @@ export function closeSavedScript(path: string, saveId: string) {
     const expected = canonical(data);
     const barrier = { since: Date.now(), kind: 'edit' };
     __ss.busy()[path] = barrier;
+    let closing = false;
     try {
       const outcome = await __ssSave(c, data, generation, barrier, ${JSON.stringify(saveId)});
       if (!outcome.saved)
@@ -103,11 +120,15 @@ export function closeSavedScript(path: string, saveId: string) {
         throw new Error('The project changed while saving; the editor was left open to preserve those edits.');
       const w = c.view?.targetWindow;
       if (!w) throw new Error('The saved editor window is unavailable; it was not closed.');
-      w.onbeforeunload = null;
-      w.close();
+      if (__ss.busy()[path] && __ss.busy()[path] !== barrier)
+        throw new Error('Another operation started on the project; the editor was left open.');
+      barrier.kind = 'edit';
+      __ss.busy()[path] = barrier;
+      closing = true;
+      ${CLOSE_AFTER_REPLY}
       return { saved: true };
     } finally {
-      if (__ss.busy()[path] === barrier && barrier.kind !== 'pendingWrite') delete __ss.busy()[path];
+      if (!closing && __ss.busy()[path] === barrier && barrier.kind !== 'pendingWrite') delete __ss.busy()[path];
     }
   `;
 }
@@ -120,6 +141,7 @@ export function closeWithoutSaveScript(path: string, expectedSha256?: string) {
     const generation = project.editGeneration;
     const barrier = { since: Date.now(), kind: 'edit' };
     __ss.busy()[path] = barrier;
+    let closing = false;
     try {
       const expectedSha256 = ${JSON.stringify(expectedSha256) ?? "undefined"};
       if (expectedSha256) {
@@ -136,9 +158,9 @@ export function closeWithoutSaveScript(path: string, expectedSha256?: string) {
       const w = c.view?.targetWindow;
       if (!w) throw new Error('The editor window is unavailable; it was not closed.');
       if (expectedSha256) project.markAsJustSaved(generation);
-      w.onbeforeunload = null;
-      w.close();
+      closing = true;
+      ${CLOSE_AFTER_REPLY}
       return true;
-    } finally { if (__ss.busy()[path] === barrier) delete __ss.busy()[path]; }
+    } finally { if (!closing && __ss.busy()[path] === barrier) delete __ss.busy()[path]; }
   `;
 }
