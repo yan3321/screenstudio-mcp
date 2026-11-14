@@ -679,6 +679,40 @@ test("luts, recovery, and project removal validate target containment and projec
   assert.ok(!mutations.some((m) => m.includes("removeProject")));
 });
 
+test("dual-codec export lookup recovers the requested destination and both delivered paths", async (t) => {
+  const app = await fakeApp(t);
+  for (const method of ["exportStart", "startRender"]) {
+    app.state.exportId = method;
+    app.state.status = "rendering";
+    const output = join(app.out, `${method}.mp4`);
+    const options = { height: 720, fps: 30, format: "mp4", quality: "studio", mp4Codec: "both" };
+    const job =
+      method === "exportStart"
+        ? await app.studio.exportStart(app.project, output, options)
+        : await app.studio.startRender(
+            app.project,
+            output,
+            options,
+            { version: "4.0.0", config: {}, scenes: [] },
+            "disk",
+          );
+    const recovered = new Studio();
+    const found = await recovered.findExport(app.project, output);
+    assert.equal(found.found, true);
+    assert.equal(found.jobId, job.jobId);
+    await app.render(".mp4");
+    await app.render("-h265.mp4");
+    const delivered = await app.studio.exportStatus(job.jobId);
+    assert.equal(delivered.status, "completed");
+    for (const path of [output, ...delivered.outputPaths]) {
+      assert.deepEqual(await recovered.findExport(app.project, path), found);
+    }
+    assert.deepEqual(await recovered.findExport(app.project, join(app.out, "unrelated.mp4")), {
+      found: false,
+    });
+  }
+});
+
 test("recordingAction finish preserves recovered-from-error projects and dual delivery recovers across probe restarts", async (t) => {
   const recoveredProj = join(await mkdtemp(join(tmpdir(), "ss-rec-proj-")), "rec.screenstudio");
   t.after(() => rm(join(recoveredProj, ".."), { recursive: true, force: true }).catch(() => {}));

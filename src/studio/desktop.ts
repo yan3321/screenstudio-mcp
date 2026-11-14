@@ -203,11 +203,16 @@ export interface DesktopKeyTiming {
   endAtMs: number | null;
 }
 
+export interface DesktopPerformTiming extends Partial<DesktopKeyTiming> {
+  completedSteps: ({ type: string; holdMs: number } & Partial<DesktopKeyTiming>)[];
+  failedStepIndex: number;
+}
+
 /** A failed action may still have injected part of the requested text. */
 export class DesktopInputError extends Error {
   constructor(
     message: string,
-    readonly timing: DesktopKeyTiming,
+    readonly timing: DesktopKeyTiming | DesktopPerformTiming,
   ) {
     super(message);
     this.name = "DesktopInputError";
@@ -489,7 +494,7 @@ export class Desktop {
       );
     }
     const started = Date.now();
-    const done: ({ type: string; holdMs: number } & Partial<DesktopKeyTiming>)[] = [];
+    const done: DesktopPerformTiming["completedSteps"] = [];
     for (const [i, action] of actions.entries()) {
       if (options.signal?.aborted)
         throw new Error(`Cancelled after ${done.length} of ${actions.length} steps.`);
@@ -498,9 +503,11 @@ export class Desktop {
         result = await this.step(observation.windowId, action, pace, options.signal);
       } catch (error) {
         const message = `Step ${i + 1} (${action.type}) failed after ${done.length} completed: ${error instanceof Error ? error.message : error}${options.onBeatStart ? '. A recording marker was already added at this beat\'s start; when you redo the beat it gets a second marker, so pin narration with skipMarkers (or rely on pinToMarkers skipping a marker with no input after it) and plan with markers: "retake" if the take was spoken' : ""}`;
-        throw error instanceof DesktopInputError
-          ? new DesktopInputError(message, error.timing)
-          : new Error(message);
+        throw new DesktopInputError(message, {
+          ...(error instanceof DesktopInputError ? error.timing : {}),
+          completedSteps: done,
+          failedStepIndex: i,
+        });
       }
       let holdMs = Math.round((steps[i].holdMs ?? HOLD[action.type]) * pace);
       if (i === actions.length - 1 && options.minDurationMs) {

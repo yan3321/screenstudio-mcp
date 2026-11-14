@@ -127,7 +127,9 @@ export function register(server: McpServer, { studio, editor }: Context) {
       }
       if (a.action === "copy") {
         if (!a.destinationPath) throw new Error("copy needs destinationPath (.screenstudio).");
-        return studio.copyProject(a.projectPath, a.destinationPath);
+        const source = await findOpenEditor(await editor.list(), a.projectPath);
+        const copied = await studio.copyProject(a.projectPath, a.destinationPath);
+        return { ...copied, ...(source?.dirty === true && { sourceHasUnsavedChanges: true }) };
       }
       if (a.action === "extractRaw") {
         if (!a.outputFolderPath) throw new Error("extractRaw needs outputFolderPath.");

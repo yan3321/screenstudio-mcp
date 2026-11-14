@@ -306,6 +306,7 @@ type ExportJob = {
   projectPath?: string;
   editFingerprint?: string;
   outputPath: string;
+  requestedOutputPath?: string;
   outputPaths?: string[];
   format: string;
   mp4Codec?: "h264" | "h265" | "both";
@@ -751,7 +752,7 @@ export class Studio {
         throw new Error(
           "Project changed after the reviewed edit; inspect and repeat privacy review before exporting.",
         );
-      return this.render(p, targets, options, current ? "live" : "disk");
+      return this.render(p, outputPath, targets, options, current ? "live" : "disk");
     });
   }
   /**
@@ -773,7 +774,13 @@ export class Studio {
       const p = await this.readProject(path);
       if (projectData?.version !== PROJECT_SCHEMA || !Array.isArray(projectData.scenes))
         throw new Error("Project data to render has an unsupported schema.");
-      return this.render({ projectPath: p.projectPath, project: projectData }, targets, options, source);
+      return this.render(
+        { projectPath: p.projectPath, project: projectData },
+        outputPath,
+        targets,
+        options,
+        source,
+      );
     });
   }
   private checkOutput(outputPath: string, options: Pick<ExportOptions, "format" | "mp4Codec">) {
@@ -799,6 +806,7 @@ export class Studio {
   }
   private async render(
     p: { projectPath: string; project: any },
+    requestedOutputPath: string,
     targets: string[],
     options: ExportOptions,
     source: "live" | "disk",
@@ -819,6 +827,7 @@ export class Studio {
       projectPath: await canonicalPath(p.projectPath),
       editFingerprint: projectEditFingerprint(p.project),
       outputPath: targets[0],
+      requestedOutputPath: resolve(requestedOutputPath),
       ...(targets.length > 1 && { outputPaths: targets }),
       format: options.format,
       ...(options.format === "mp4" && mp4Codec && { mp4Codec }),
@@ -889,7 +898,13 @@ export class Studio {
       if (
         saved.projectPath &&
         (await canonicalPath(saved.projectPath)) === project &&
-        (await canonicalPath(saved.outputPath)) === output
+        (
+          await Promise.all(
+            [saved.requestedOutputPath, saved.outputPath, ...(saved.outputPaths ?? [])]
+              .filter((path): path is string => path !== undefined)
+              .map(canonicalPath),
+          )
+        ).includes(output)
       )
         matches.push({ jobId: m[1], editFingerprint: saved.editFingerprint });
     }

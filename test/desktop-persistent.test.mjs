@@ -136,6 +136,49 @@ function timingOf(result) {
   return { clock, onsetsMs, endAtMs };
 }
 
+test("perform preserves completed typing timing and the failing step through SDK and MCP errors", async () => {
+  const { DesktopInputError } = await import("../dist/studio/desktop.js");
+  const { register } = await import("../dist/mcp/tools/desktop.js");
+  const desktop = new Desktop();
+  const steps = [
+    { action: { type: "type", text: "first" }, holdMs: 0 },
+    { action: { type: "type", text: "second" }, holdMs: 0 },
+  ];
+  const completedSteps = [{ type: "type", holdMs: 0, ...typedTiming }];
+  const tools = new Map();
+  register({ registerTool: (name, _config, handler) => tools.set(name, handler) }, { studio: {}, desktop });
+  for (const failure of [
+    new DesktopInputError("Focus lost after one key", keyTiming),
+    new Error("Helper disconnected"),
+  ]) {
+    desktop.run = async (action, _windowId, args) => {
+      if (action === "inspect") return { pid: 123, bounds: { x: 0, y: 0, width: 800, height: 600 } };
+      assert.equal(action, "type");
+      if (args[0] === "first") return typedTiming;
+      throw failure;
+    };
+    const timing = {
+      ...(failure instanceof DesktopInputError ? keyTiming : {}),
+      completedSteps,
+      failedStepIndex: 1,
+    };
+    const token = async () => (await desktop.inspect(123)).observationToken;
+    await assert.rejects(desktop.perform(await token(), steps), (error) => {
+      assert.ok(error instanceof DesktopInputError);
+      assert.match(error.message, /Step 2 \(type\) failed after 1 completed/);
+      assert.deepEqual(error.timing, timing);
+      return true;
+    });
+    const response = await tools.get("screenstudio_desktop_perform")(
+      { observationToken: await token(), steps, pace: 1 },
+      {},
+    );
+    assert.equal(response.isError, true);
+    assert.match(response.content[0].text, /Step 2 \(type\) failed after 1 completed/);
+    assert.deepEqual(JSON.parse(response.content[1].text), timing);
+  }
+});
+
 if (process.platform === "darwin") {
   test("persistent typing preserves uneven measured grapheme and shortcut timing, including partial failure", async (t) => {
     const { DesktopInputError } = await import("../dist/studio/desktop.js");
@@ -212,7 +255,10 @@ if (process.platform === "darwin") {
       });
       assert.equal(response.isError, true);
       assert.match(response.content[0].text, /Focus lost after two graphemes/);
-      assert.deepEqual(JSON.parse(response.content[1].text), partialTiming);
+      assert.deepEqual(JSON.parse(response.content[1].text), {
+        ...partialTiming,
+        ...(name === "perform" && { completedSteps: [], failedStepIndex: 0 }),
+      });
     }
   });
 }

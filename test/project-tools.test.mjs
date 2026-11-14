@@ -202,6 +202,46 @@ async function makeProjectBundle(dir, name = "demo.screenstudio", config = {}) {
   return proj;
 }
 
+test("project copy reports unsaved source changes across symlink paths without saving", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ss-copy-dirty-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const projectPath = await makeProjectBundle(root);
+  const alias = join(root, "alias.screenstudio");
+  await symlink(projectPath, alias);
+  const destinationPath = join(root, "copy.screenstudio");
+  const copied = { projectPath: destinationPath, copiedFrom: projectPath };
+  let openEditors = [{ projectPath: alias, dirty: true }];
+  const calls = [];
+  const call = collectTools((server) =>
+    registerProject(server, {
+      studio: {
+        copyProject: async (source, destination) => {
+          calls.push({ source, destination });
+          return copied;
+        },
+      },
+      editor: {
+        list: async () => openEditors,
+        save: async () => assert.fail("Copy must not save the source"),
+      },
+    }),
+  );
+  const args = { action: "copy", projectPath, destinationPath };
+  assert.deepEqual(await call("screenstudio_project_manage", args), {
+    ...copied,
+    sourceHasUnsavedChanges: true,
+  });
+  for (const editors of [
+    [{ projectPath: alias, dirty: false }],
+    [{ projectPath: destinationPath, dirty: true }],
+    [],
+  ]) {
+    openEditors = editors;
+    assert.deepEqual(await call("screenstudio_project_manage", args), copied);
+  }
+  assert.deepEqual(calls, Array(4).fill({ source: projectPath, destination: destinationPath }));
+});
+
 test("project tools: symlink-aware open detection, import partial recovery, asset validation & live reference guard", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "ss-proj-tools-"));
   t.after(() => rm(root, { recursive: true, force: true }));
