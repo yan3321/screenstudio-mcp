@@ -1,11 +1,13 @@
 // Narration and music: spec merging, library names, the duck envelope and cleanup rules.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   duckEnvelope,
+  music,
+  narrate,
   narrationInput,
   narrationSpec,
   orphanedAudio,
@@ -17,6 +19,7 @@ import {
 } from "../dist/studio/narration.js";
 import { catalog, musicLibrary, readAsar } from "../dist/studio/assets.js";
 import { z } from "zod";
+import { shortHash } from "../dist/studio/util.js";
 
 const lines = [{ sourceMs: 1000, text: "Here is the dashboard." }];
 
@@ -112,7 +115,7 @@ test("the previous track is told apart as narration, music or a custom track", (
   assert.equal(previousTrack("my-song.mp3", null, null).kind, "custom");
 });
 
-test("only unreferenced tool-made audio is swept from a project", () => {
+test("candidate audio cleanup excludes custom files and supplied references", () => {
   const files = [
     "narration-17-aaa.m4a",
     "narration-18-bbb.m4a",
@@ -127,7 +130,7 @@ test("only unreferenced tool-made audio is swept from a project", () => {
 });
 
 /** A minimal app.asar: pickle-framed JSON header, then file contents. */
-async function fakeApp(files) {
+async function fakeApp(t, files) {
   const root = { files: {} };
   const blobs = [];
   let offset = 0;
@@ -149,13 +152,14 @@ async function fakeApp(files) {
   head.writeUInt32LE(json.length, 12);
   json.copy(head, 16);
   const app = await mkdtemp(join(tmpdir(), "ss-app-"));
+  t.after(() => rm(app, { recursive: true, force: true }));
   await mkdir(join(app, "Contents/Resources"), { recursive: true });
   await writeFile(join(app, "Contents/Resources/app.asar"), Buffer.concat([head, ...blobs]));
   return app;
 }
 
-test("the music library is read from the app bundle, names as shipped", async () => {
-  const app = await fakeApp({
+test("the music library is read from the app bundle, names as shipped", async (t) => {
+  const app = await fakeApp(t, {
     "assets/background-audio/lo-fi/Sunny Lo‑Fi.mp3": "sunny",
     "assets/background-audio/lo-fi/.DS_Store": "",
     "assets/background-audio/commercial/Product Uplift.mp3": "uplift",
@@ -170,4 +174,58 @@ test("the music library is read from the app bundle, names as shipped", async ()
     "lo-fi": ["lo-fi/Sunny Lo‑Fi"],
     commercial: ["commercial/Product Uplift"],
   });
+});
+
+test(
+  "music over an existing narration reports an incomplete cache instead of deadlocking its own queue",
+  { timeout: 2000 },
+  async (t) => {
+    const appPath = await fakeApp(t, { "assets/background-audio/commercial/Product Uplift.mp3": "fixture" });
+    const stateDir = await mkdtemp(join(tmpdir(), "ss-audio-queue-"));
+    t.after(() => rm(stateDir, { recursive: true, force: true }));
+    const projectPath = join(stateDir, "owned.screenstudio");
+    const fileName = "narration-1-fixture.m4a";
+    await writeFile(join(stateDir, `narration-${shortHash(projectPath)}.json`), JSON.stringify({ fileName }));
+    const studio = {
+      appPath,
+      stateDir,
+      path: async (path) => path,
+      call: async () => assert.fail("no native or voice call is needed"),
+    };
+    const editor = {
+      requireEditable: async () => {},
+      liveProject: async () => ({ config: { audio: { backgroundAudioFileName: fileName } }, scenes: [] }),
+    };
+    await assert.rejects(
+      music(studio, editor, projectPath, {
+        track: "commercial/Product Uplift",
+        volume: 0.1,
+        duckUnderSpeech: true,
+        duckTo: 0.3,
+      }),
+      /No earlier narration/,
+    );
+  },
+);
+
+test("narration and music refuse an unsupported write build before reading assets or contacting a provider", async () => {
+  const studio = { path: async (p) => p };
+  const editor = {
+    requireEditable: async () => {
+      throw new Error("Unsupported Screen Studio build");
+    },
+  };
+  await assert.rejects(
+    narrate(studio, editor, "/owned.screenstudio", { lines: [{ sourceMs: 0, text: "Fixture." }] }),
+    /Unsupported Screen Studio build/,
+  );
+  await assert.rejects(
+    music(studio, editor, "/owned.screenstudio", {
+      track: "unread",
+      volume: 1,
+      duckUnderSpeech: true,
+      duckTo: 0.3,
+    }),
+    /Unsupported Screen Studio build/,
+  );
 });

@@ -5,6 +5,7 @@ import { DESTRUCTIVE, path, toolsOn } from "../tool.js";
 import { configPartial } from "../../studio/editor/ops.js";
 import { applyPartial } from "../../studio/deliver.js";
 import { catalog } from "../../studio/assets.js";
+import { extractPresetConfig } from "../../studio/project.js";
 import {
   brandInput,
   brandSlug,
@@ -15,21 +16,6 @@ import {
   saveBrand,
   type Brand,
 } from "../../studio/brand.js";
-
-/** The config groups a Screen Studio preset carries. */
-const PRESET_GROUPS = [
-  "cursor",
-  "captions",
-  "audio",
-  "camera",
-  "animations",
-  "processing",
-  "zooms",
-  "defaultLayout",
-  "device",
-  "output",
-  "styles",
-];
 
 export function register(server: McpServer, ctx: Context) {
   const { studio, editor } = ctx;
@@ -99,12 +85,11 @@ export function register(server: McpServer, ctx: Context) {
           structuredClone(t.project.config),
           configPartial(t.project.config, changes),
         );
-        const presetConfig = Object.fromEntries(
-          PRESET_GROUPS.filter((g) => g in config).map((g) => [g, config[g]]),
-        );
+        const presetConfig = extractPresetConfig(config);
         try {
+          await studio.requireVersion();
           const result = await studio.call("mutation", "presets.createFromConfig", {
-            name: brand.name,
+            presetName: brand.name,
             config: presetConfig,
           });
           return {
@@ -142,6 +127,7 @@ export function register(server: McpServer, ctx: Context) {
       );
       const partial = "partial" in applied;
       return {
+        ...applied,
         brand: brand.name,
         changed: Object.keys(changes),
         checkpointId: applied.checkpointId,
@@ -149,6 +135,13 @@ export function register(server: McpServer, ctx: Context) {
         notes: [
           ...notes,
           ...audioNote(brand),
+          ...("saved" in applied && applied.saved === false
+            ? [
+                applied.saveOutcome === "notSent"
+                  ? "Brand settings are live, but this save was not dispatched. Inspect the live editor before saving again."
+                  : "Brand settings are live, but their save was not confirmed. Inspect the save observation before continuing.",
+              ]
+            : []),
           "Undo in the app (Cmd+Z), screenstudio_editor_history, or screenstudio_editor_restore with the checkpointId.",
         ],
       };

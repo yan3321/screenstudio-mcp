@@ -28,6 +28,12 @@ export function describeScene(scene: { slices: Slice[]; zooms: Zoom[]; layouts?:
       blur: m.blur,
       highlightMaskOpacity: m.highlightMaskOpacity,
     })),
+    sourceSlices: scene.slices.map(({ id, sourceStartMs, sourceEndMs, timeScale }) => ({
+      id,
+      sourceStartMs,
+      sourceEndMs,
+      timeScale,
+    })),
     slices: mapSlices(scene.slices).map((s) => ({
       id: s.id,
       sourceStartMs: round(s.sourceStartMs),
@@ -50,6 +56,7 @@ export function describeScene(scene: { slices: Slice[]; zooms: Zoom[]; layouts?:
         target: z.type === "manual" ? z.manualTargetPoint : undefined,
         presentation: z.presentation ?? "screen",
         loupe: z.presentation === "loupe" ? (z as any).loupeOptions : undefined,
+        instant: z.hasInstantAnimation || undefined,
         disabled: z.isDisabled || undefined,
       };
     }),

@@ -1,12 +1,28 @@
 // ffmpeg, ffprobe and screencapture, found and spawned one way.
 import { execFile } from "node:child_process";
-import { access, readFile, stat } from "node:fs/promises";
+import { access, readFile, stat, mkdir, rename, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, extname } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 
 export const exec = promisify(execFile);
+
+/** Owned inputs must outlive every launched worker, including after a sibling fails. */
+export async function drainMediaWork<T>(work: Promise<T>[]): Promise<T[]> {
+  let failure: { reason: unknown } | undefined;
+  const outcomes = await Promise.allSettled(
+    work.map((pending) =>
+      pending.catch((reason) => {
+        failure ??= { reason };
+        throw reason;
+      }),
+    ),
+  );
+  if (failure) throw failure.reason;
+  return outcomes.flatMap((outcome) => (outcome.status === "fulfilled" ? [outcome.value] : []));
+}
 
 /** ffmpeg or ffprobe: an env override, the usual install places, then PATH. Null when missing. */
 export async function locateTool(name: "ffmpeg" | "ffprobe"): Promise<string | null> {
@@ -77,6 +93,58 @@ export async function durationMs(path: string) {
   return Number(stdout) * 1000;
 }
 
+const readable = new Map<string, Promise<string>>();
+
+/** HLS fragment timestamps are absolute; remux once before clip-relative seeking. */
+export async function readableVideo(video: string): Promise<string> {
+  if (extname(video).toLowerCase() !== ".m3u8") return video;
+  const playlist = await readFile(video, "utf8");
+  if (!playlist.includes("#EXT-X-ENDLIST"))
+    throw new Error("Finish the recording before reading its HLS frames.");
+  const info = await stat(video);
+  const key = createHash("sha256").update(`${video}:${info.mtimeMs}:${playlist}`).digest("hex");
+  let pending = readable.get(key);
+  if (!pending) {
+    pending = (async () => {
+      const dir = join(
+        process.env.SCREENSTUDIO_STATE_DIR ?? join(homedir(), ".screenstudio-mcp"),
+        "raw-cache",
+      );
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const out = join(dir, `${key}.mp4`);
+      if ((await stat(out).catch(() => null))?.size) return out;
+      const temp = join(dir, `${key}-${randomUUID()}.mp4`);
+      try {
+        await ffmpeg(
+          [
+            "-y",
+            "-i",
+            video,
+            "-map",
+            "0:v:0",
+            "-c",
+            "copy",
+            "-an",
+            "-map_metadata",
+            "-1",
+            "-avoid_negative_ts",
+            "disabled",
+            temp,
+          ],
+          { timeoutMs: 120000 },
+        );
+        await rename(temp, out);
+        return out;
+      } finally {
+        await rm(temp, { force: true });
+      }
+    })();
+    readable.set(key, pending);
+    pending.catch(() => readable.delete(key));
+  }
+  return pending;
+}
+
 /**
  * Writes the frame at `seconds` into a video as a PNG, optionally through a
  * filter. A seek past the last frame writes nothing while ffmpeg still exits 0,
@@ -88,13 +156,15 @@ export async function frameAt(
   out: string,
   options: { vf?: string; timeoutMs?: number } = {},
 ) {
+  const source = await readableVideo(video);
+  await rm(out, { force: true });
   await ffmpeg(
     [
       "-y",
       "-ss",
       String(seconds),
       "-i",
-      video,
+      source,
       "-frames:v",
       "1",
       ...(options.vf ? ["-vf", options.vf] : []),

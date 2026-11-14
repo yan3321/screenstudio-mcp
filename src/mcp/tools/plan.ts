@@ -307,7 +307,7 @@ export function register(server: McpServer, ctx: Context) {
       markers: z.enum(["ignore", "keep", "retake", "chapters"]).optional(),
       markerBeatsMs: z.array(z.number().int().min(0).max(120000)).max(200).optional(),
       side: z
-        .union([z.literal("auto"), z.literal(0), z.literal(1)])
+        .union([z.literal("auto"), z.number().int().min(0).max(1)])
         .default("auto")
         .describe("Cutout camera side: 0 left, 1 right, auto away from the clicks."),
       bookends: z.boolean().default(true),
@@ -353,7 +353,7 @@ export function register(server: McpServer, ctx: Context) {
         };
       }
       const layouts = planLayouts(r, edit, {
-        side: a.side,
+        side: a.side === "auto" ? "auto" : a.side === 0 ? 0 : 1,
         bookends: a.bookends,
         splitScreen: a.splitScreen,
         loupesScreenOnly: a.loupesScreenOnly,

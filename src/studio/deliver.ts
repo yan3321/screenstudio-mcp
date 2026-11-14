@@ -1898,7 +1898,11 @@ export async function makeLoop(
       loop.notes.push(`This project has no ${missing.join(", ")} setting, so it was left out.`);
     const applied = await editor.apply(copy, undefined, ops, req.show ? { stepMs: 350 } : undefined);
     if ("partial" in applied) throw new Error(`The loop copy could not be edited: ${applied.error}`);
-    await editor.save(copy);
+    const saved = await editor.save(copy);
+    if (!saved.saved)
+      throw new Error(
+        `The loop copy was not confirmed saved (${saved.saveOutcome}); rendering was not started. Inspect ${copy}${saved.saveId ? ` with saveId ${saved.saveId}` : "; no save observation ID was returned"} before retrying.`,
+      );
     const live = await editor.liveProject(copy);
     if (!live) throw new Error("The loop copy is not open in the editor; open it and run again.");
     const keepMp4 = req.formats.includes("mp4");
@@ -1926,6 +1930,7 @@ export async function makeLoop(
       throw new Error(`The loop render ended as ${done.status}${done.error ? `: ${done.error}` : ""}.`);
     const files: Record<string, string> = {};
     const notes = [...loop.notes];
+    const warnings: string[] = [];
     if (keepMp4) files.mp4 = mp4;
     const temps: string[] = [];
     const temp = async (name: string) => {
@@ -1933,37 +1938,73 @@ export async function makeLoop(
       temps.push(p);
       return p;
     };
+    const warn = (label: string, e: unknown) => {
+      const msg = `${label} failed: ${e instanceof Error ? e.message : String(e)}`;
+      warnings.push(msg);
+      notes.push(msg);
+    };
     try {
       if (req.formats.includes("webm")) {
-        const tmp = await temp(`loop-${randomUUID()}.webm`);
-        await toWebm(mp4, tmp);
-        files.webm = await copyNew(tmp, dir, base, "webm");
+        try {
+          const tmp = await temp(`loop-${randomUUID()}.webm`);
+          await toWebm(mp4, tmp);
+          files.webm = await copyNew(tmp, dir, base, "webm");
+        } catch (e) {
+          warn("WebM loop transcode", e);
+        }
       }
       if (req.formats.includes("gif")) {
-        const tmp = await temp(`loop-${randomUUID()}.gif`);
-        const fit = await fitGif(async (o) => {
-          await toGif(mp4, tmp, o);
-          return (await stat(tmp)).size;
-        }, req.maxGifBytes);
-        files.gif = await copyNew(tmp, dir, base, "gif");
-        notes.push(
-          fit.fits
-            ? `GIF at ${fit.fps}fps, ${fit.height}px tall, ${(fit.bytes / 1e6).toFixed(1)} MB.`
-            : `GIF is ${(fit.bytes / 1e6).toFixed(1)} MB even at ${fit.fps}fps and ${fit.height}px; use the WebM or a shorter targetMs.`,
-        );
+        try {
+          const tmp = await temp(`loop-${randomUUID()}.gif`);
+          const fit = await fitGif(async (o) => {
+            await toGif(mp4, tmp, o);
+            return (await stat(tmp)).size;
+          }, req.maxGifBytes);
+          files.gif = await copyNew(tmp, dir, base, "gif");
+          notes.push(
+            fit.fits
+              ? `GIF at ${fit.fps}fps, ${fit.height}px tall, ${(fit.bytes / 1e6).toFixed(1)} MB.`
+              : `GIF is ${(fit.bytes / 1e6).toFixed(1)} MB even at ${fit.fps}fps and ${fit.height}px; use the WebM or a shorter targetMs.`,
+          );
+        } catch (e) {
+          warn("GIF loop transcode", e);
+        }
       }
-      const timing = mediaSummary(await probe(mp4));
-      const first = await videoFrame(studio, mp4, 0);
-      temps.push(first);
-      const last = await videoFrame(studio, mp4, timing.durationMs);
-      temps.push(last);
-      files.poster = await copyNew(first, dir, `${base}-poster`, "png");
-      const seam = await sideBySide(studio, [
-        { path: first, label: "first frame" },
-        { path: last, label: `last frame · ${clock(timing.durationMs)}` },
-      ]);
-      notes.push(...seam.notes);
-      return { loop, project: copy, files, media: timing, seam, notes, embed: loopEmbed(files) };
+      if (req.formats.every((f) => !files[f]))
+        throw new Error(`All requested loop formats failed (${warnings.join("; ") || "unknown error"}).`);
+      const timing = await probe(mp4)
+        .then(mediaSummary)
+        .catch((e) => {
+          warn("Loop media probe", e);
+          return undefined;
+        });
+      let seam: Awaited<ReturnType<typeof sideBySide>> | undefined;
+      if (timing) {
+        try {
+          const first = await videoFrame(studio, mp4, 0);
+          temps.push(first);
+          const last = await videoFrame(studio, mp4, timing.durationMs);
+          temps.push(last);
+          files.poster = await copyNew(first, dir, `${base}-poster`, "png");
+          seam = await sideBySide(studio, [
+            { path: first, label: "first frame" },
+            { path: last, label: `last frame · ${clock(timing.durationMs)}` },
+          ]);
+          notes.push(...seam.notes);
+        } catch (e) {
+          warn("Loop poster and seam preview", e);
+        }
+      }
+      return {
+        loop,
+        project: copy,
+        files,
+        ...(timing && { media: timing }),
+        ...(seam && { seam }),
+        notes,
+        ...(warnings.length > 0 && { warnings }),
+        embed: loopEmbed(files),
+      };
     } finally {
       for (const t of temps) await rm(t, { force: true }).catch(() => {});
       if (!keepMp4) await rm(mp4, { force: true }).catch(() => {});

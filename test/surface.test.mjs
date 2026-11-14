@@ -2,16 +2,20 @@
 // status features and the native helper's keyboard layout lookup.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { validateConfigChange } from "../dist/studio/project.js";
-import { configPartial } from "../dist/studio/editor/ops.js";
+import { offlineTransport } from "./support/stdio.mjs";
+import { inspectProjectBundle, validateConfigChange } from "../dist/studio/project.js";
+import { configPartial, editOp } from "../dist/studio/editor/ops.js";
 import { desktopAction, helperArgs, helperTimeoutMs } from "../dist/studio/desktop.js";
 import { span } from "../dist/mcp/tool.js";
-import { features, presetPaths } from "../dist/mcp/tools/app.js";
+import { assertPresetSource, features, findPresetPath, presetPaths } from "../dist/mcp/tools/app.js";
+import { defaultExportFps } from "../dist/mcp/tools/export.js";
+import { validateExportOptions } from "../dist/studio/service.js";
 
 const config = () => ({
   animations: {
@@ -119,6 +123,55 @@ test("background gradients, inset origins and hidden shortcuts have exact rules"
   assert.throws(() => validateConfigChange(c, "captions.hiddenShortcuts", { "cmd+tab": "yes" }));
 });
 
+test("4.1.0-5005 optional fields and expanded editor ops validate safely", () => {
+  const base = {
+    ...config(),
+    camera: { hide: false, background: { blurAmount01: 0 } },
+    processing: { improveRecordingQuality01: 0.5 },
+  };
+  // Group exists, optional leaf is omitted in serialized config until set:
+  assert.equal(validateConfigChange(base, "camera.delayAdjustmentMs", -120), -120);
+  assert.equal(validateConfigChange(base, "camera.background.edgeInsetPx", 12), 12);
+  assert.equal(validateConfigChange(base, "processing.autoMaskSensitiveData", true), true);
+  assert.equal(validateConfigChange(base, "processing.sensitiveDataExpandPx", 18), 18);
+  assert.deepEqual(validateConfigChange(base, "processing.sensitiveDataCustomPhrases", ["secret-key"]), [
+    "secret-key",
+  ]);
+  assert.equal(validateConfigChange(base, "processing.autoMaskFaces", true), true);
+  // Switching from an image backdrop that omitted gradient/color/systemName/blur still works:
+  const imgConfig = { styles: { background: { type: "image", image: "bg.png" } } };
+  assert.equal(validateConfigChange(imgConfig, "styles.background.type", "gradient"), "gradient");
+  assert.equal(validateConfigChange(imgConfig, "styles.background.color", "#112233"), "#112233");
+  // Missing parent group or unknown keys remain rejected:
+  assert.throws(() => validateConfigChange(config(), "camera.delayAdjustmentMs", 0), /Unknown config field/);
+  assert.throws(() => validateConfigChange(base, "processing.unknownFlag", true), /Unknown config field/);
+  assert.throws(() => validateConfigChange(base, "camera.nonExistent", 1), /Unknown config field/);
+
+  // Expanded layout options, zoom instant on updateZoom, and slice audio volumes:
+  assert.ok(
+    editOp.safeParse({
+      op: "addLayout",
+      startMs: 0,
+      endMs: 2000,
+      type: "camera-overlay",
+      options: { cameraOverlay: { overlayCameraSizeRatio01: 0.35, overlayZoomedCameraScale: 0.8 } },
+    }).success,
+  );
+  assert.ok(
+    editOp.safeParse({
+      op: "updateZoom",
+      zoomId: "z1",
+      instant: true,
+    }).success,
+  );
+  assert.ok(
+    editOp.safeParse({
+      op: "setSlices",
+      slices: [{ startMs: 0, endMs: 1000, speed: 1, systemAudioVolume: 0.6, externalDeviceAudioVolume: 0.5 }],
+    }).success,
+  );
+});
+
 test("a null field with no known shape takes plain values only", () => {
   assert.throws(
     () => validateConfigChange(config(), "styles.background.image", { path: "/x.png" }),
@@ -152,21 +205,31 @@ test("status reports the editing features this server has", () => {
   assert.equal(features.voiceoverGeneration, false);
 });
 
-test("a preset can only be applied by a path the presets list returned", () => {
-  const paths = presetPaths([{ name: "Brand", path: "/p/brand.json" }, { path: "/p/dark.json" }]);
+test("a preset can only be applied by a path or id the presets list returned", () => {
+  const listing = [{ id: "id-1", name: "/outside/victim", path: "/p/brand.json" }, { path: "/p/dark.json" }];
+  const paths = presetPaths(listing);
   assert.ok(paths.has("/p/brand.json") && paths.has("/p/dark.json"));
   assert.ok(!paths.has("/p/other.json"));
+  assert.ok(!paths.has("/outside/victim"));
+  assert.ok(!paths.has("path"));
+  assert.equal(findPresetPath(listing, "/p/brand.json"), "/p/brand.json");
+  assert.equal(findPresetPath(listing, "id-1"), "/p/brand.json");
+  assert.equal(findPresetPath(listing, "/outside/victim"), undefined);
+  assert.equal(findPresetPath(listing, "path"), undefined);
 });
 
-test("tools that discard work or go online say so", async () => {
+test("tools that discard work or go online say so", async (t) => {
   const client = new Client({ name: "annotations", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const { tools } = await client.listTools();
     const hints = (name) => tools.find((t) => t.name === name).annotations;
     assert.equal(hints("screenstudio_record_control").destructiveHint, true);
+    assert.equal(hints("screenstudio_record_recover").destructiveHint, true);
+    assert.equal(hints("screenstudio_project_manage").destructiveHint, true);
+    assert.equal(hints("screenstudio_project_asset").destructiveHint, true);
+    assert.equal(hints("screenstudio_presets").destructiveHint, true);
+    assert.equal(hints("screenstudio_luts").destructiveHint, true);
     assert.equal(hints("screenstudio_narrate").openWorldHint, true);
     assert.equal(hints("screenstudio_transcript_generate").openWorldHint, true);
     assert.equal(hints("screenstudio_music").destructiveHint, false);
@@ -205,4 +268,58 @@ test("shortcuts follow the keyboard layout, not US key positions", { skip: !nati
     run(helper, ["resolve-key", "z", "", "com.apple.keylayout.Russian"]),
     /not on the current/,
   );
+});
+
+test("preset import accepts .screenstudiopreset packages and files while rejecting incomplete inputs", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "ss-preset-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const bundle = join(dir, "Valid.screenstudiopreset");
+  await mkdir(bundle);
+  await writeFile(join(bundle, "meta.json"), JSON.stringify({ version: "4.0.0" }));
+  assert.equal(await assertPresetSource(bundle), bundle);
+
+  const file = join(dir, "Legacy.screenstudiopreset");
+  await writeFile(file, "{}");
+  assert.equal(await assertPresetSource(file), file);
+
+  const emptyBundle = join(dir, "Empty.screenstudiopreset");
+  await mkdir(emptyBundle);
+  await assert.rejects(assertPresetSource(emptyBundle), /missing meta\.json/);
+  await assert.rejects(assertPresetSource("relative.screenstudiopreset"), /absolute/);
+  await assert.rejects(assertPresetSource(join(dir, "wrong.json")), /\.screenstudiopreset/);
+  await assert.rejects(assertPresetSource(join(dir, "Missing.screenstudiopreset")), /No preset found/);
+});
+
+test("export defaults and bundle inspector enforce format-specific fps and minimum project structure", async (t) => {
+  for (const format of ["mp4", "prores", "gif"]) {
+    assert.doesNotThrow(() =>
+      validateExportOptions({
+        height: 1080,
+        fps: defaultExportFps(format),
+        format,
+        quality: "studio",
+      }),
+    );
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "ss-bundle-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, "project.json"), JSON.stringify({ json: { version: "4.0.0" } }));
+  assert.equal((await inspectProjectBundle(dir)).valid, false);
+  await writeFile(
+    join(dir, "project.json"),
+    JSON.stringify({ json: { version: "4.0.0", config: null, scenes: "broken" } }),
+  );
+  assert.equal((await inspectProjectBundle(dir)).valid, false);
+  await writeFile(
+    join(dir, "project.json"),
+    JSON.stringify({ json: { version: "4.0.0", config: {}, scenes: [{}] } }),
+  );
+  assert.equal((await inspectProjectBundle(dir)).valid, false);
+  await writeFile(
+    join(dir, "project.json"),
+    JSON.stringify({ json: { version: "4.0.0", config: {}, scenes: [] } }),
+  );
+  assert.equal((await inspectProjectBundle(dir)).valid, true);
 });

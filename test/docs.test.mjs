@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFile, readdir, access } from "node:fs/promises";
 import { dirname, join, normalize } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { offlineTransport } from "./support/stdio.mjs";
 import { RESOURCES } from "../dist/mcp/resources.js";
 import { editOp } from "../dist/studio/editor/ops.js";
 import { configFields } from "../dist/studio/project.js";
@@ -32,11 +32,9 @@ const localLinks = (text) =>
   [...text.matchAll(/\]\(([^)\s#]+)(?:#[^)]*)?\)/g)].map((m) => m[1]).filter((l) => !/^[a-z]+:/.test(l));
 const opNames = new Set(editOp.options.map((o) => o.shape.op.value));
 
-async function serverSurface() {
+async function serverSurface(t) {
   const client = new Client({ name: "docs", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const { tools } = await client.listTools();
     const { prompts } = await client.listPrompts();
@@ -52,8 +50,8 @@ async function serverSurface() {
   }
 }
 
-test("docs name only registered tools, prompts, resources and status fields", async () => {
-  const { names, uris, statusFields } = await serverSurface();
+test("docs name only registered tools, prompts, resources and status fields", async (t) => {
+  const { names, uris, statusFields } = await serverSurface(t);
   for (const { path, text } of docs) {
     for (const [name] of text.matchAll(/\bscreenstudio_[a-z_]+/g))
       assert.ok(names.has(name), `${path}: ${name}`);
@@ -114,11 +112,9 @@ test("craft lists exactly the layouts that can be the default", () => {
   assert.deepEqual(listed, [...configFields["defaultLayout.type"].options].sort());
 });
 
-test("prompts paste the skill without its front matter, then the stage guides", async () => {
+test("prompts paste the skill without its front matter, then the stage guides", async (t) => {
   const client = new Client({ name: "prompts", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const text = async (name, args) =>
       (await client.getPrompt({ name, arguments: args })).messages[0].content.text;
@@ -136,4 +132,21 @@ test("prompts paste the skill without its front matter, then the stage guides", 
   } finally {
     await client.close();
   }
+});
+
+test("protocol tests construct stdio clients only through the isolated fixture", async () => {
+  const direct = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (
+        entry.name.endsWith(".mjs") &&
+        /new\s+StdioClientTransport\s*\(|dist[\/]mcp[\/]main\.js/.test(await readFile(path, "utf8"))
+      )
+        direct.push(normalize(path));
+    }
+  }
+  await visit("test");
+  assert.deepEqual(direct, [normalize("test/support/stdio.mjs")]);
 });

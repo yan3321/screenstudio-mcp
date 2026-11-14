@@ -2,7 +2,7 @@
 // and on-screen change, all in source milliseconds with 0-1 frame coordinates.
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ffmpeg } from "./media.js";
+import { ffmpeg, readableVideo } from "./media.js";
 import type { Valley } from "./audio.js";
 import { mergeSpans, type Span } from "./spans.js";
 import { shortHash, statePath } from "./util.js";
@@ -162,7 +162,7 @@ async function screenActivity(video: string, offsetMs: number): Promise<{ t: num
     [
       "-nostats",
       "-i",
-      video,
+      await readableVideo(video),
       "-vf",
       "fps=10,scale=320:-2,select='gte(scene,0)',metadata=print:key=lavfi.scene_score:file=-",
       "-an",

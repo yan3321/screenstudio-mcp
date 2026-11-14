@@ -9,7 +9,7 @@ if (!source) throw new Error("Pass a seeded sample project.");
 const studio = new Studio();
 const job = await studio.exportStart(source, resolve(`.artifacts/alternate-${Date.now()}.gif`), {
   height: 240,
-  fps: 24,
+  fps: 15,
   format: "gif",
   quality: "studio",
 });

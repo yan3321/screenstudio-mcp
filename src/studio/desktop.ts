@@ -1,10 +1,12 @@
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { readFile, access } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { captureWindow, exec } from "./media.js";
 import { statePath } from "./util.js";
-const helper = fileURLToPath(new URL("../../native/desktop-helper", import.meta.url));
+export const HELPER_PATH = fileURLToPath(new URL("../../native/desktop-helper", import.meta.url));
+const helper = HELPER_PATH;
 const point = { x: z.number().finite().min(0), y: z.number().finite().min(0) };
 /**
  * Shortcuts macOS handles itself, before the target app sees them: Spotlight,
@@ -14,7 +16,16 @@ const point = { x: z.number().finite().min(0), y: z.number().finite().min(0) };
 export function systemShortcut(key: string, modifiers: string[] = []) {
   const m = new Set(modifiers);
   if (!m.has("command")) return null;
-  if (key === "space" || key === "tab" || key === "q" || key === "escape")
+  if (
+    key === "space" ||
+    key === "tab" ||
+    key === "q" ||
+    key === "w" ||
+    key === "h" ||
+    key === "m" ||
+    key === "`" ||
+    key === "escape"
+  )
     return `command+${[...m]
       .filter((x) => x !== "command")
       .concat(key)
@@ -24,7 +35,21 @@ export function systemShortcut(key: string, modifiers: string[] = []) {
 }
 
 export const desktopAction = z.discriminatedUnion("type", [
-  z.object({ type: z.enum(["click", "doubleClick", "move"]), ...point }).strict(),
+  z
+    .object({
+      type: z.enum(["click", "doubleClick"]),
+      ...point,
+      durationMs: z.number().finite().min(0).max(15000).optional(),
+      settleMs: z.number().finite().min(0).max(5000).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("move"),
+      ...point,
+      durationMs: z.number().finite().min(0).max(15000).optional(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("drag"),
@@ -42,7 +67,13 @@ export const desktopAction = z.discriminatedUnion("type", [
     })
     .strict(),
   z.object({ type: z.literal("hold"), ...point, ms: z.number().int().min(50).max(15000) }).strict(),
-  z.object({ type: z.literal("type"), text: z.string().max(2000) }).strict(),
+  z
+    .object({
+      type: z.literal("type"),
+      text: z.string().max(2000),
+      perCharMs: z.number().finite().min(0).max(2000).optional(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal("scroll"),
@@ -75,6 +106,11 @@ export const desktopAction = z.discriminatedUnion("type", [
     }),
 ]);
 export type DesktopAction = z.infer<typeof desktopAction>;
+export const desktopSessionAction = z.union([
+  desktopAction,
+  z.object({ type: z.enum(["down", "up"]), ...point }).strict(),
+]);
+export type DesktopSessionAction = z.infer<typeof desktopSessionAction>;
 
 // How long the result of each kind of step stays on screen before the next one.
 export const HOLD: Record<DesktopAction["type"], number> = {
@@ -100,19 +136,37 @@ const HELPER_TIMEOUT_MS = 80000;
  * 25ms + 190ms x pace per character plus a focus check, so its limit grows
  * with the text instead of cutting a long take off halfway.
  */
-export function helperTimeoutMs(input: DesktopAction, pace = 1): number {
+export function helperTimeoutMs(input: DesktopSessionAction, pace = 1): number {
   if (input.type === "taps") return Math.max(HELPER_TIMEOUT_MS, input.count * input.intervalMs + 10000);
   if (input.type === "hold") return Math.max(HELPER_TIMEOUT_MS, input.ms + 10000);
   if (input.type !== "type") return HELPER_TIMEOUT_MS;
-  return Math.max(HELPER_TIMEOUT_MS, Math.ceil(input.text.length * (40 + 200 * pace)) + 10000);
+  const perChar = input.perCharMs !== undefined ? Math.max(40, input.perCharMs + 40) : 40 + 200 * pace;
+  return Math.max(HELPER_TIMEOUT_MS, Math.ceil(input.text.length * perChar) + 10000);
 }
 
 /** Command-line arguments the native helper takes for one action. */
-export function helperArgs(input: DesktopAction): string[] {
+export function helperArgs(input: DesktopSessionAction): string[] {
   switch (input.type) {
     case "click":
     case "doubleClick":
+      return [
+        String(input.x),
+        String(input.y),
+        ...(input.settleMs !== undefined
+          ? [String(input.settleMs)]
+          : input.durationMs !== undefined
+            ? ["-1"]
+            : []),
+        ...(input.durationMs !== undefined ? [String(input.durationMs)] : []),
+      ];
     case "move":
+      return [
+        String(input.x),
+        String(input.y),
+        ...(input.durationMs !== undefined ? [String(input.durationMs)] : []),
+      ];
+    case "down":
+    case "up":
       return [String(input.x), String(input.y)];
     case "drag":
       return [input.x, input.y, input.toX, input.toY].map(String);
@@ -121,7 +175,7 @@ export function helperArgs(input: DesktopAction): string[] {
     case "hold":
       return [input.x, input.y, input.ms].map(String);
     case "type":
-      return [input.text];
+      return [input.text, ...(input.perCharMs !== undefined ? [String(input.perCharMs)] : [])];
     case "scroll":
       return [input.lines, ...(input.x !== undefined && input.y !== undefined ? [input.x, input.y] : [])].map(
         String,
@@ -141,22 +195,196 @@ export function lastHoldMs(plannedMs: number, elapsedMs: number, minDurationMs: 
   return Math.max(plannedMs, Math.ceil(minDurationMs - elapsedMs));
 }
 
+/** Native injection times on the helper's clock; no UI paint guarantee. */
+export interface DesktopKeyTiming {
+  clock: string;
+  onsetsMs: number[];
+  /** Null when no key-up was posted (including empty text). */
+  endAtMs: number | null;
+}
+
+/** A failed action may still have injected part of the requested text. */
+export class DesktopInputError extends Error {
+  constructor(
+    message: string,
+    readonly timing: DesktopKeyTiming,
+  ) {
+    super(message);
+    this.name = "DesktopInputError";
+  }
+}
+
+export class DesktopSession {
+  private proc: ReturnType<typeof spawn>;
+  private nextId = 1;
+  private buffer = "";
+  private closed = false;
+  private stopped: Promise<void>;
+  private stopError?: Error;
+  private expectedTarget?: { pid: number; bounds: Record<string, number> };
+  private pending = new Map<
+    number,
+    { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >();
+
+  private constructor(
+    proc: ReturnType<typeof spawn>,
+    private readonly windowId: number,
+    private readonly defaultPace: number,
+  ) {
+    this.proc = proc;
+    proc.stdout?.setEncoding("utf8");
+    proc.stderr?.resume();
+    this.stopped = new Promise((resolve) => proc.once("close", () => resolve()));
+    proc.stdout?.on("data", (chunk: Buffer | string) => {
+      this.buffer += chunk.toString();
+      let idx: number;
+      while ((idx = this.buffer.indexOf("\n")) !== -1) {
+        const line = this.buffer.slice(0, idx).trim();
+        this.buffer = this.buffer.slice(idx + 1);
+        if (!line) continue;
+        let msg: any;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (this.closed) continue;
+        const entry = this.pending.get(msg.id);
+        if (!entry) continue;
+        if (!msg.ok) {
+          const message = msg.error || "Desktop helper action failed";
+          void this.stop(
+            msg.result?.onsetsMs ? new DesktopInputError(message, msg.result) : new Error(message),
+          );
+          continue;
+        }
+        this.pending.delete(msg.id);
+        clearTimeout(entry.timer);
+        entry.resolve(msg.result);
+      }
+    });
+    const failAll = (err: Error) => {
+      this.closed = true;
+      for (const [id, entry] of this.pending) {
+        this.pending.delete(id);
+        clearTimeout(entry.timer);
+        entry.reject(err);
+      }
+    };
+    proc.stdin?.on("error", (err) => {
+      void this.stop(err);
+    });
+    proc.on("error", (err) => failAll(err));
+    proc.on("exit", (code, signal) => {
+      failAll(this.stopError ?? new Error(`Desktop session exited (${signal ?? code ?? "unknown"})`));
+    });
+  }
+
+  static async open(windowId: number, pace = 1, helperPath = helper): Promise<DesktopSession> {
+    if (process.platform !== "darwin") throw new Error("Desktop input requires macOS.");
+    await access(helperPath).catch(() => {
+      throw new Error("Build the native desktop helper with npm run build:native.");
+    });
+    const proc = spawn(helperPath, ["--stdio"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, SCREENSTUDIO_PACE: String(pace) },
+    });
+    return new DesktopSession(proc, windowId, pace);
+  }
+
+  private request(payload: Record<string, unknown>, timeoutMs = HELPER_TIMEOUT_MS): Promise<any> {
+    if (this.closed || !this.proc.stdin?.writable) {
+      return Promise.reject(new Error("Desktop session is closed."));
+    }
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        void this.stop(new Error(`Desktop session timed out after ${Math.round(timeoutMs / 1000)}s.`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      this.proc.stdin!.write(`${JSON.stringify({ ...payload, id })}\n`);
+    });
+  }
+
+  async bounds() {
+    const state = await this.request({
+      action: "bounds",
+      windowId: this.windowId,
+      ...(this.expectedTarget ? { expect: this.expectedTarget } : {}),
+    });
+    this.expectedTarget ??= { pid: state.pid, bounds: state.bounds };
+    return state;
+  }
+  hideApp(bundleId = "com.timpler.screenstudio") {
+    return this.request({ action: "hide-app", bundleId });
+  }
+  inspect() {
+    return this.request({ action: "inspect", windowId: this.windowId });
+  }
+  async focus() {
+    if (!this.expectedTarget) await this.bounds();
+    return this.request({ action: "focus", windowId: this.windowId, expect: this.expectedTarget });
+  }
+  async send(input: DesktopSessionAction, pace = this.defaultPace) {
+    const parsed = desktopSessionAction.parse(input);
+    if (!this.expectedTarget) await this.bounds();
+    const { type, ...rest } = parsed;
+    return this.request(
+      { action: type, windowId: this.windowId, expect: this.expectedTarget, pace, ...rest },
+      helperTimeoutMs(parsed, pace),
+    );
+  }
+  private async stop(error: Error) {
+    if (!this.closed) {
+      this.closed = true;
+      this.stopError = error;
+      this.proc.kill("SIGTERM");
+    }
+    const force = setTimeout(() => this.proc.kill("SIGKILL"), 2000);
+    try {
+      await this.stopped;
+    } finally {
+      clearTimeout(force);
+    }
+  }
+  async close() {
+    if (this.closed) {
+      await this.stopped;
+      return;
+    }
+    this.closed = true;
+    this.proc.stdin?.end();
+    const terminate = setTimeout(() => this.proc.kill("SIGTERM"), 1000);
+    const force = setTimeout(() => this.proc.kill("SIGKILL"), 3000);
+    try {
+      await this.stopped;
+    } finally {
+      clearTimeout(terminate);
+      clearTimeout(force);
+    }
+  }
+}
+
 export class Desktop {
+  constructor(private readonly helperPath = helper) {}
+
   private observations = new Map<string, { windowId: number; bounds: string; pid: number; at: number }>();
   private async run(
     action: string,
-    target: number | string,
+    target?: number | string,
     args: string[] = [],
     pace = 1,
     timeout = HELPER_TIMEOUT_MS,
     signal?: AbortSignal,
   ) {
     if (process.platform !== "darwin") throw new Error("Desktop input requires macOS.");
-    await access(helper).catch(() => {
+    await access(this.helperPath).catch(() => {
       throw new Error("Build the native desktop helper with npm run build:native.");
     });
+    const argv = target === undefined ? [action, ...args] : [action, String(target), ...args];
     try {
-      const { stdout } = await exec(helper, [action, String(target), ...args], {
+      const { stdout } = await exec(this.helperPath, argv, {
         timeout,
         signal,
         env: { ...process.env, SCREENSTUDIO_PACE: String(pace) },
@@ -170,12 +398,35 @@ export class Desktop {
           `The ${action} step did not finish within ${Math.round(timeout / 1000)}s and was stopped; it may have left partial input (for typing, some text in the field).`,
         );
       const reason = typeof error?.stderr === "string" ? error.stderr.trim() : "";
-      if (reason) throw new Error(reason);
+      if (reason) {
+        if ((action === "type" || action === "key") && error?.stdout) {
+          let timing: DesktopKeyTiming | undefined;
+          try {
+            timing = JSON.parse(error.stdout);
+          } catch {
+            // Older helpers report only stderr on failure.
+          }
+          if (timing?.onsetsMs) throw new DesktopInputError(reason, timing);
+        }
+        throw new Error(reason);
+      }
       throw error;
     }
   }
   async findWindowByTitle(title: string): Promise<number> {
     return (await this.run("find-title", title)).windowId;
+  }
+  hideApp(bundleId = "com.timpler.screenstudio") {
+    return this.run("hide-app", bundleId);
+  }
+  settleHiddenApp(bundleId = "com.timpler.screenstudio") {
+    return this.run("settle-hidden-app", bundleId);
+  }
+  bounds(windowId: number) {
+    return this.run("bounds", windowId);
+  }
+  startSession(windowId: number, pace = 1) {
+    return DesktopSession.open(windowId, pace, this.helperPath);
   }
   async inspect(windowId: number) {
     const state = await this.run("inspect", windowId);
@@ -238,16 +489,18 @@ export class Desktop {
       );
     }
     const started = Date.now();
-    const done: { type: string; holdMs: number }[] = [];
+    const done: ({ type: string; holdMs: number } & Partial<DesktopKeyTiming>)[] = [];
     for (const [i, action] of actions.entries()) {
       if (options.signal?.aborted)
         throw new Error(`Cancelled after ${done.length} of ${actions.length} steps.`);
+      let result;
       try {
-        await this.step(observation.windowId, action, pace, options.signal);
+        result = await this.step(observation.windowId, action, pace, options.signal);
       } catch (error) {
-        throw new Error(
-          `Step ${i + 1} (${action.type}) failed after ${done.length} completed: ${error instanceof Error ? error.message : error}${options.onBeatStart ? '. A recording marker was already added at this beat\'s start; when you redo the beat it gets a second marker, so pin narration with skipMarkers (or rely on pinToMarkers skipping a marker with no input after it) and plan with markers: "retake" if the take was spoken' : ""}`,
-        );
+        const message = `Step ${i + 1} (${action.type}) failed after ${done.length} completed: ${error instanceof Error ? error.message : error}${options.onBeatStart ? '. A recording marker was already added at this beat\'s start; when you redo the beat it gets a second marker, so pin narration with skipMarkers (or rely on pinToMarkers skipping a marker with no input after it) and plan with markers: "retake" if the take was spoken' : ""}`;
+        throw error instanceof DesktopInputError
+          ? new DesktopInputError(message, error.timing)
+          : new Error(message);
       }
       let holdMs = Math.round((steps[i].holdMs ?? HOLD[action.type]) * pace);
       if (i === actions.length - 1 && options.minDurationMs) {
@@ -258,7 +511,13 @@ export class Desktop {
           );
         holdMs = held;
       }
-      done.push({ type: action.type, holdMs });
+      done.push({
+        type: action.type,
+        holdMs,
+        ...(result?.onsetsMs
+          ? { clock: result.clock, onsetsMs: result.onsetsMs, endAtMs: result.endAtMs }
+          : {}),
+      });
       await new Promise<void>((r) => {
         const t = setTimeout(r, holdMs);
         options.signal?.addEventListener("abort", () => (clearTimeout(t), r()), { once: true });

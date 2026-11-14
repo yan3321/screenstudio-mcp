@@ -3,13 +3,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-test("stdio server advertises editing tools and rejects malformed edits", async () => {
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: ["dist/mcp/main.js"],
-    stderr: "pipe",
-  });
+import { offlineTransport } from "./support/stdio.mjs";
+test("stdio server advertises editing tools and rejects malformed edits", async (t) => {
+  const transport = await offlineTransport(t);
   const client = new Client({ name: "smoke", version: "1" });
   try {
     await client.connect(transport);
@@ -34,6 +30,13 @@ test("stdio server advertises editing tools and rejects malformed edits", async 
       "catalog",
       "editor_view",
       "presets",
+      "projects",
+      "project_import",
+      "project_manage",
+      "project_asset",
+      "luts",
+      "record_recover",
+      "window",
     ])
       assert.ok(
         tools.some((t) => t.name === `screenstudio_${name}`),
@@ -45,6 +48,13 @@ test("stdio server advertises editing tools and rejects malformed edits", async 
       arguments: {},
     });
     assert.equal(result.isError, undefined);
+    assert.equal(JSON.parse(result.content.at(-1).text).connected, false);
+    const inspect = await client.callTool({
+      name: "screenstudio_desktop_inspect",
+      arguments: { windowId: 1 },
+    });
+    assert.equal(inspect.isError, true);
+    assert.match(inspect.content[0].text, /Offline protocol fixture refuses child_process\.execFile/);
     const bad = await client.callTool({
       name: "screenstudio_editor_apply",
       arguments: {
@@ -56,4 +66,76 @@ test("stdio server advertises editing tools and rejects malformed edits", async 
   } finally {
     await client.close();
   }
+});
+
+test("every registered tool emits only string enum values", async (t) => {
+  const client = new Client({ name: "schema-compatibility", version: "1" });
+  try {
+    await client.connect(await offlineTransport(t));
+    let cursor;
+    let count = 0;
+    do {
+      const page = await client.listTools(cursor ? { cursor } : {});
+      for (const tool of page.tools) {
+        count++;
+        const walk = (value, path) => {
+          if (!value || typeof value !== "object") return;
+          assert.notEqual(typeof value.const, "number", `${path}.const`);
+          if (Array.isArray(value.enum)) {
+            assert.ok(
+              value.enum.every((entry) => typeof entry === "string"),
+              `${path}.enum`,
+            );
+          }
+          for (const [key, child] of Object.entries(value)) walk(child, `${path}.${key}`);
+        };
+        walk(tool.inputSchema, tool.name);
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.ok(count > 0);
+  } finally {
+    await client.close();
+  }
+});
+
+test("fps accepts exactly the supported numbers and rejects others with a clear error", async () => {
+  const { z } = await import("zod");
+  const { register } = await import("../dist/mcp/tools/export.js");
+  let schema;
+  let handler;
+  const received = [];
+  register(
+    {
+      registerTool(name, config, fn) {
+        if (name === "screenstudio_export_start") {
+          schema = z.object(config.inputSchema);
+          handler = fn;
+        }
+      },
+    },
+    {
+      timeline: async () => ({ projectPath: "/fixture.screenstudio", project: {}, config: {} }),
+      cachedAnalysis: () => undefined,
+      editor: {},
+      studio: {
+        exportStart: async (_project, _output, options) => {
+          received.push(options.fps);
+          return { jobId: "fixture" };
+        },
+      },
+    },
+  );
+  const args = { projectPath: "/fixture.screenstudio", outputPath: "/fixture.mp4", wait: false };
+  for (const fps of [10, 15, 20, 24, 25, 30, 50, 60]) {
+    const result = await handler(schema.parse({ ...args, fps }), {});
+    assert.equal(result.isError, undefined, result.content[0].text);
+  }
+  assert.deepEqual(received, [10, 15, 20, 24, 25, 30, 50, 60]);
+  for (const fps of [0, 12, 29.97, 120, -1]) {
+    const parsed = schema.safeParse({ ...args, fps });
+    assert.equal(parsed.success, false);
+    assert.equal(parsed.error.issues[0].message, "fps must be one of: 10, 15, 20, 24, 25, 30, 50, 60.");
+  }
+  assert.equal(schema.safeParse({ ...args, fps: "30" }).success, false);
 });

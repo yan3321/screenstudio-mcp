@@ -23,7 +23,7 @@ export function register(server: McpServer, ctx: Context) {
 
   tool(
     "screenstudio_find_sensitive",
-    `Find private text in the footage before publishing and propose blur masks for it. Reads frames (every everyMs plus just before and after each screen change) with macOS text recognition and looks for emails, phone numbers (including +E.164 and labelled digits), API keys and tokens (sk-, ghp_, xox, AKIA, AWS secret keys, Stripe, Google, private key headers), JSON web tokens, hex keys and hashes (32+ hex digits with letters; digit-only IDs such as post IDs in links, and IDs run into hex at either end, are not flagged), long random strings, card numbers (Luhn checked), IP addresses, links carrying tokens (with or without https://), passwords and secrets in settings, .env lines and connection strings, and any extraTerms (plain words, or /regex/flags; a term inside a longer secret widens the blur to the whole secret). Long recordings are read end to end: the frame grid widens to fit maxFrames. Each finding is followed across frames into one span with a padded box (0-1 of the capture). Returns detections with a masked preview (never the full value), a preview sheet of up to six frames that show the findings (each at least 960px wide, every blur filled red, existing blur masks included, every finding seen there ringed in yellow and numbered, with its kind and masked value listed under the frame), notes explaining the choices, and addMask sensitive-data ops for screenstudio_editor_apply. With apply: true the masks are added live in the open editor (undoable, then saved). An existing blur mask grows to cover new findings; a highlight or disabled mask blocks a blur, and the notes say where. ignore drops kinds that are expected on screen (${SENSITIVE_KINDS.join(", ")}).`,
+    `Find private text in the footage before publishing and propose blur masks for it. Reads frames (every everyMs plus just before and after each screen change) with macOS text recognition and looks for emails, phone numbers (including +E.164 and labelled digits), API keys and tokens (sk-, ghp_, xox, AKIA, AWS secret keys, Stripe, Google, private key headers), JSON web tokens, hex keys and hashes (32+ hex digits with letters; digit-only IDs such as post IDs in links, and IDs run into hex at either end, are not flagged), long random strings, card numbers (Luhn checked), IP addresses, links carrying tokens (with or without https://), passwords and secrets in settings, .env lines and connection strings, and any extraTerms (plain words, or /regex/flags; a term inside a longer secret widens the blur to the whole secret). Long recordings are read end to end: the frame grid widens to fit maxFrames. Each finding is followed across frames into one span with a padded box (0-1 of the capture). Returns detections with a masked preview (never the full value), a preview sheet of up to six frames that show the findings (each at least 960px wide, every blur filled red, existing blur masks included, every finding seen there ringed in yellow and numbered, with its kind and masked value listed under the frame), notes explaining the choices, and addMask sensitive-data ops for screenstudio_editor_apply. With apply: true the masks are added live in the open editor (undoable; saving is attempted and its outcome is reported). An existing blur mask grows to cover new findings; a highlight or disabled mask blocks a blur, and the notes say where. ignore drops kinds that are expected on screen (${SENSITIVE_KINDS.join(", ")}).`,
     {
       projectPath: path,
       everyMs: z.number().int().min(250).max(10000).default(1000),
@@ -56,13 +56,25 @@ export function register(server: McpServer, ctx: Context) {
         const { ops, skipped } = maskOps(scan.detections, { existing });
 
         let applied:
-          { partial?: boolean; failedAt?: number; checkpointId?: string; error?: string } | undefined;
+          | {
+              partial?: boolean;
+              refused?: boolean;
+              failedAt?: number;
+              checkpointId?: string;
+              error?: string;
+              saved?: boolean;
+              saveOutcome?: string;
+              saveId?: string;
+            }
+          | undefined;
         if (a.apply && ops.length) {
           // A finished scan is never thrown away because the masks could not be applied.
           applied = (await editor
             .apply(a.projectPath, undefined, ops, { stepMs: 350 }, { save: true })
             .catch((e) => ({
-              partial: true,
+              partial: typeof e?.checkpointId === "string",
+              refused: typeof e?.checkpointId !== "string",
+              ...(typeof e?.checkpointId === "string" ? { checkpointId: e.checkpointId } : {}),
               error: e instanceof Error ? e.message : String(e),
             }))) as typeof applied;
         }
@@ -75,12 +87,33 @@ export function register(server: McpServer, ctx: Context) {
           detections: scan.detections,
           ops,
           skipped,
-          applied: !applied ? "none" : applied.partial ? "partial" : "applied",
+          applied: !applied || applied.refused ? "none" : applied.partial ? "partial" : "applied",
           landed: applied?.partial && typeof applied.failedAt === "number" ? applied.failedAt : undefined,
           checkpointId: applied?.checkpointId,
           capped: scan.capped,
         });
-        const result = { detections: scan.detections, ops, notes, ...(applied ? { applied } : {}) };
+        const result = {
+          detections: scan.detections,
+          ops,
+          notes,
+          skipped,
+          coverage: {
+            capped: scan.capped,
+            textLines: scan.textLines,
+            stepMs: scan.stepMs,
+            frames: scan.times.length,
+            unread: analysis.screen.unread ?? [],
+            unavailable: analysis.screen.unavailable,
+          },
+          ...(applied ? { applied } : {}),
+        };
+        if (applied?.saved === false)
+          notes.push(
+            applied.saveOutcome === "notSent"
+              ? "Blur masks are live, but this save was not dispatched. Inspect the live editor before saving again."
+              : "Blur masks are live, but their save was not confirmed. Inspect the save observation before exporting or continuing.",
+          );
+        if (applied?.refused) notes.push(`Mask application was refused before any op: ${applied.error}`);
         if (!scan.detections.length) return result;
 
         // Up to six frames that between them show every finding, each blur filled and each finding ringed and numbered.

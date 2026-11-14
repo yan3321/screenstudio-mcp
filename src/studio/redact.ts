@@ -6,7 +6,7 @@
 import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { exec, ffmpeg, filterPath, frameAt, hasFilter, labelFont } from "./media.js";
+import { drainMediaWork, exec, ffmpeg, filterPath, frameAt, hasFilter, labelFont } from "./media.js";
 import { subtractSpans, type Span } from "./spans.js";
 
 export interface Rect {
@@ -723,8 +723,9 @@ export async function extractFrames(
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const files = times.map((t, i) => join(dir, `frame-${String(i).padStart(4, "0")}-${t}.png`));
   let next = 0;
+  let failed = false;
   const worker = async () => {
-    while (next < times.length) {
+    while (!failed && next < times.length) {
       const i = next++;
       const { video, localMs } = locate(times[i]);
       // Full resolution reads small text best; very large frames only slow OCR down.
@@ -742,7 +743,14 @@ export async function extractFrames(
       });
     }
   };
-  await Promise.all([worker(), worker(), worker(), worker()]);
+  await drainMediaWork(
+    Array.from({ length: 4 }, () =>
+      worker().catch((error) => {
+        failed = true;
+        throw error;
+      }),
+    ),
+  );
   return files;
 }
 
@@ -952,12 +960,12 @@ export async function contactSheet(
 ) {
   const shown = frames.slice(0, 6);
   const font = (await hasFilter("drawtext")) ? await labelFont() : null;
-  const labelled = await Promise.all(
+  const labelled = await drainMediaWork(
     shown.map(async (f, i) => {
       if (!font) return f;
       const dir = join(options.workDir, "preview-labels");
       await mkdir(dir, { recursive: true, mode: 0o700 });
-      const labelFiles = await Promise.all(
+      const labelFiles = await drainMediaWork(
         f.marks.map(async (m, j) => {
           const file = join(dir, `${i}-${j}.txt`);
           await writeFile(file, m.label, { mode: 0o600 });

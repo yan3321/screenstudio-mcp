@@ -16,13 +16,14 @@ The person may keep their own defaults (editing taste, pacing, narration voice a
 | Job | Tools |
 | --- | --- |
 | Connect | `screenstudio_status` (start here: connection, build, open editors, recording state, `knownSettings`), `screenstudio_launch`, `screenstudio_quit` |
-| Record | `screenstudio_sources`, `screenstudio_record_start`, `screenstudio_record_control` (pause, marker, finish), `screenstudio_record_state`, `screenstudio_desktop_inspect`, `screenstudio_desktop_screenshot`, `screenstudio_desktop_perform` (a whole beat), `screenstudio_desktop_action` (one step), `screenstudio_voice_lines` |
+| Record | `screenstudio_sources`, `screenstudio_window` (focus/resize), `screenstudio_record_start`, `screenstudio_record_control` (pause, marker, finish), `screenstudio_record_state`, `screenstudio_record_recover`, `screenstudio_desktop_inspect`, `screenstudio_desktop_screenshot`, `screenstudio_desktop_perform` (a whole beat), `screenstudio_desktop_action` (one step), `screenstudio_voice_lines` |
+| Projects & assets | `screenstudio_projects`, `screenstudio_project_import`, `screenstudio_project_manage`, `screenstudio_project_asset`, `screenstudio_luts` |
 | Understand | `screenstudio_edit_context` (start of every edit), `screenstudio_analyze`, `screenstudio_source_frames`, `screenstudio_transcript_generate`, `screenstudio_transcript_read`, `screenstudio_transcript_edit` |
 | Plan | `screenstudio_plan_edit`, `screenstudio_plan_layouts`, `screenstudio_check_pacing`, `screenstudio_recipes`, `screenstudio_catalog`, `screenstudio_brand`, `screenstudio_presets` |
 | Edit live | `screenstudio_editor_apply` (ops), `screenstudio_editor_state`, `screenstudio_editor_open`, `screenstudio_editor_list`, `screenstudio_editor_view`, `screenstudio_editor_seek`, `screenstudio_editor_play`, `screenstudio_editor_history`, `screenstudio_editor_restore`, `screenstudio_editor_save`, `screenstudio_project_duplicate` (only when asked) |
 | Sound and privacy | `screenstudio_narrate`, `screenstudio_music`, `screenstudio_find_sensitive` |
 | Look | `screenstudio_contact_sheet`, `screenstudio_editor_frame`, `screenstudio_export_frame` |
-| Deliver | `screenstudio_export_start`, `screenstudio_export_status`, `screenstudio_export_cancel`, `screenstudio_export_variants`, `screenstudio_loop` |
+| Deliver | `screenstudio_export_start` (MP4/ProRes/GIF), `screenstudio_export_status`, `screenstudio_export_cancel`, `screenstudio_export_variants`, `screenstudio_loop` |
 
 Slices, zooms, markers and the footage analysis use source ms; the editor state, pacing report and frames use playback ms. Every apply returns both.
 

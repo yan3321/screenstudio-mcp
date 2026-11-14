@@ -18,6 +18,7 @@ import * as exporting from "./tools/export.js";
 import * as delivery from "./tools/deliver.js";
 import * as brand from "./tools/brand.js";
 import * as privacy from "./tools/privacy.js";
+import * as project from "./tools/project.js";
 
 const { version } = JSON.parse(await packageFile("package.json"));
 const server = new McpServer(
@@ -36,7 +37,7 @@ const server = new McpServer(
 
 const ctx = new Context();
 pruneState(ctx.studio.stateDir)
-  .then(() => ctx.studio.deliverPending())
+  .then(() => Promise.allSettled([ctx.studio.deliverPending(), ctx.editor.recoverMutationReceipts()]))
   .catch(() => {});
 for (const tools of [
   app,
@@ -51,6 +52,7 @@ for (const tools of [
   delivery,
   brand,
   privacy,
+  project,
 ])
   tools.register(server, ctx);
 resources.register(server);

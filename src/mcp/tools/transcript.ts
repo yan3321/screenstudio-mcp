@@ -32,7 +32,13 @@ export function register(server: McpServer, { studio }: Context) {
         await studio.path(a.projectPath),
         a.generator ? { locale: a.locale, ...a.generator } : { type: "system", locale: a.locale },
       );
-      return { sessions: t.sessions, words: t.words.length, phrases: phrases(t.words), editor: t.editor };
+      return {
+        sessions: t.sessions,
+        words: t.words.length,
+        phrases: phrases(t.words),
+        editor: t.editor,
+        ...("note" in t && t.note ? { note: t.note } : {}),
+      };
     },
   );
 

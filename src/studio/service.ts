@@ -1,23 +1,34 @@
 import { existsSync } from "node:fs";
-import { withSession } from "../cdp/client.js";
-import { APP_BUILD, PROJECT_SCHEMA } from "./compat.js";
+import { pathToFileURL } from "node:url";
+import { CommandNotSentError, withSession } from "../cdp/client.js";
+import {
+  APP_BUILD,
+  INPUTS_CHUNK,
+  INPUTS_EXPORT,
+  NATIVE_CLIENT_CHUNK,
+  NATIVE_CLIENT_EXPORT,
+  PROJECT_SCHEMA,
+} from "./compat.js";
 import { exec, findTool, frameAt, probe } from "./media.js";
+import { assertProjectBundle, findAssetReferences, projectEditFingerprint } from "./project.js";
 import { assertUuid, statePath } from "./util.js";
 import {
   access,
   copyFile,
   cp,
   link,
+  lstat,
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { constants } from "node:fs";
 import { connect, createServer } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 const j = JSON.stringify;
@@ -34,16 +45,45 @@ export function configuredPort(env: NodeJS.ProcessEnv = process.env): number | n
   return port;
 }
 
-/** The app's main process in `ps -o command=` output, with the debugging port it was started with. */
-export function mainProcess(ps: string, appPath: string): { port: number | null } | null {
+function findMainLine(ps: string, appPath: string): string | undefined {
   const lines = ps.split("\n");
   // The configured copy first; otherwise any Screen Studio.app, wherever macOS put it.
-  const line =
+  return (
     lines.find((l) => l.startsWith(`${appPath}/Contents/MacOS/Screen Studio`)) ??
-    lines.find((l) => /^\/.*\/Screen Studio\.app\/Contents\/MacOS\/Screen Studio( |$)/.test(l));
+    lines.find((l) => /^\/.*\/Screen Studio\.app\/Contents\/MacOS\/Screen Studio( |$)/.test(l))
+  );
+}
+
+/** The app's main process in `ps -o command=` output, with the debugging port it was started with. */
+export function mainProcess(ps: string, appPath: string): { port: number | null } | null {
+  const line = findMainLine(ps, appPath);
   if (line === undefined) return null;
   const port = Number(/--remote-debugging-port=(\d+)/.exec(line)?.[1]);
   return { port: port >= 1024 && port <= 65535 ? port : null };
+}
+
+/** The `.app` bundle path of the running Screen Studio main process, if found in `ps`. */
+export function runningBundlePath(ps: string, appPath: string): string | null {
+  const line = findMainLine(ps, appPath);
+  if (line === undefined) return null;
+  const match = /^(\/.*\/Screen Studio\.app)\/Contents\/MacOS\/Screen Studio(?: |$)/.exec(line);
+  return match?.[1] ?? (line.startsWith(`${appPath}/Contents/MacOS/Screen Studio`) ? appPath : null);
+}
+
+export async function canonicalPath(target: string): Promise<string> {
+  let cur = resolve(target);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const base = await realpath(cur);
+      return tail.length ? join(base, ...tail.reverse()) : base;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(cur, ...tail.reverse());
+      tail.push(basename(cur));
+      cur = parent;
+    }
+  }
 }
 
 /** Why launch cannot help with an app that is already running. */
@@ -204,9 +244,71 @@ export async function videoTiming(path: string) {
   return { endSec: Number(v.duration) || Number(format?.duration) || 0, frameSec: 1 / fps };
 }
 
-type ExportJob = {
-  outputPath: string;
+export const EXPORT_SPECS = {
+  mp4: {
+    extension: "mp4",
+    fps: [60, 50, 30, 25, 24, 20, 10] as const,
+    qualities: ["studio", "social-media", "web-high", "web-low"] as const,
+  },
+  prores: {
+    extension: "mov",
+    fps: [60, 50, 30, 25, 24, 20, 10] as const,
+    qualities: ["studio"] as const,
+  },
+  gif: {
+    extension: "gif",
+    fps: [50, 30, 25, 20, 15, 10] as const,
+    qualities: ["studio", "social-media"] as const,
+  },
+} as const;
+
+export type ExportFormat = keyof typeof EXPORT_SPECS;
+export type ExportOptions = {
+  height: number;
+  fps: number;
   format: string;
+  quality: string;
+  mp4Codec?: "h264" | "h265" | "both";
+  proResProfile?: "422-lt" | "422" | "422-hq" | "4444";
+  gifDisableLoop?: boolean;
+  keepRender?: boolean;
+};
+
+export function exportExtension(format: string): string {
+  if (!(format in EXPORT_SPECS)) throw new Error(`Unsupported export format: ${format}.`);
+  return EXPORT_SPECS[format as ExportFormat].extension;
+}
+
+export function dualMp4Paths(outputPath: string): { h264: string; h265: string } {
+  const stem = outputPath.slice(0, -4);
+  return { h264: `${stem}-h264.mp4`, h265: `${stem}-h265.mp4` };
+}
+
+export function validateExportOptions(options: ExportOptions) {
+  if (!(options.format in EXPORT_SPECS))
+    throw new Error(`Unsupported export format "${options.format}". Use mp4, prores, or gif.`);
+  const spec = EXPORT_SPECS[options.format as ExportFormat];
+  if (!spec.fps.includes(options.fps as never))
+    throw new Error(`${options.format} exports support fps in [${spec.fps.join(", ")}], got ${options.fps}.`);
+  if (!spec.qualities.includes(options.quality as never))
+    throw new Error(
+      `${options.format} exports support quality in [${spec.qualities.join(", ")}], got "${options.quality}".`,
+    );
+  if (options.mp4Codec !== undefined && options.format !== "mp4")
+    throw new Error('mp4Codec is only valid when format is "mp4".');
+  if (options.proResProfile !== undefined && options.format !== "prores")
+    throw new Error('proResProfile is only valid when format is "prores".');
+  if (options.gifDisableLoop !== undefined && options.format !== "gif")
+    throw new Error('gifDisableLoop is only valid when format is "gif".');
+}
+
+type ExportJob = {
+  projectPath?: string;
+  editFingerprint?: string;
+  outputPath: string;
+  outputPaths?: string[];
+  format: string;
+  mp4Codec?: "h264" | "h265" | "both";
   /** Whether the render used the open editor's project or the saved one. */
   source?: "live" | "disk";
   keepRender?: boolean;
@@ -214,6 +316,7 @@ type ExportJob = {
   status?: string;
   renderedPath?: string;
   delivered?: boolean;
+  deliveredCodecs?: Partial<Record<"h264" | "h265", { outputPath: string; renderedPath: string }>>;
   completed?: any;
 };
 const RUNNING = [undefined, "starting", "rendering"];
@@ -226,13 +329,31 @@ export class Studio {
   );
   readonly stateDir = resolve(process.env.SCREENSTUDIO_STATE_DIR ?? join(homedir(), ".screenstudio-mcp"));
   private tail: Promise<unknown> = Promise.resolve();
+  private projectLocks = new Map<string, Promise<unknown>>();
+  private runningAppPath: string | null = null;
   private jobs = new Map<string, ExportJob>();
   /** The running app's main process, if any. */
   private async running() {
     const { stdout } = await exec("/bin/ps", ["-axww", "-o", "command="], {
       maxBuffer: 16 * 1024 * 1024,
     }).catch(() => ({ stdout: "" }));
+    this.runningAppPath = runningBundlePath(stdout, this.appPath);
     return mainProcess(stdout, this.appPath);
+  }
+  /** Serializes open vs move/remove operations on the same project path without blocking Studio.lock. */
+  async projectLock<T>(projectPath: string, fn: () => Promise<T>): Promise<T> {
+    const key = await this.path(projectPath).catch(() => canonicalPath(projectPath));
+    const previous = this.projectLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((r) => (release = r));
+    this.projectLocks.set(key, tail);
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.projectLocks.get(key) === tail) this.projectLocks.delete(key);
+    }
   }
   /** Whether the app is running at all; when it is not, no editor holds unsaved edits. */
   async isRunning() {
@@ -252,9 +373,10 @@ export class Studio {
     return running.port;
   }
   async evaluate<T = any>(body: string, timeout = 30000): Promise<T> {
-    return withSession(await this.port(), (c) =>
-      c.evaluateAwait<T>(`(async function(){${body}})()`, timeout),
-    );
+    const port = await this.port().catch((error) => {
+      throw new CommandNotSentError(error);
+    });
+    return withSession(port, (c) => c.evaluateAwait<T>(`(async function(){${body}})()`, timeout));
   }
   /** A file path in the private state directory, which is created on first use. */
   statePath(name: string) {
@@ -278,7 +400,14 @@ export class Studio {
   }
   private async saveJob(jobId: string) {
     const { status, ...job } = this.jobs.get(jobId)!;
-    await writeFile(await this.statePath(`export-${jobId}.json`), j(job), { mode: 0o600 });
+    const path = await this.statePath(`export-${jobId}.json`);
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, j(job), { mode: 0o600 });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
   async lock<T>(fn: () => Promise<T>): Promise<T> {
     const previous = this.tail;
@@ -297,14 +426,17 @@ export class Studio {
     input?: unknown,
     timeout = 30000,
   ): Promise<T> {
-    return withSession(await this.port(), (c) =>
+    const port = await this.port().catch((error) => {
+      throw new CommandNotSentError(error);
+    });
+    return withSession(port, (c) =>
       c.evaluateAwait<T>(`bridge.client.${kind}(${j(route)},${j(input) ?? "undefined"})`, timeout),
     );
   }
-  async subscription<T = any>(route: string, input?: unknown): Promise<T> {
+  async subscription<T = any>(route: string, input?: unknown, timeoutMs = 5000): Promise<T> {
     return withSession(await this.port(), (c) =>
       c.evaluate<T>(
-        `return new Promise((resolve,reject)=>{let stop;const timer=setTimeout(()=>{stop?.();reject(new Error('State subscription timed out'));},5000);stop=bridge.client.subscription(${j(route)},${j(input) ?? "undefined"},{onNext(v){if(v.type==='data'){clearTimeout(timer);stop?.();resolve(v.data);}},onError(e){clearTimeout(timer);stop?.();reject(e);}});});`,
+        `return new Promise((resolve,reject)=>{let stop;const timer=setTimeout(()=>{stop?.();reject(new Error('State subscription timed out'));},${timeoutMs});stop=bridge.client.subscription(${j(route)},${j(input) ?? "undefined"},{onNext(v){if(v.type==='data'){clearTimeout(timer);stop?.();resolve(v.data);}},onError(e){clearTimeout(timer);stop?.();reject(e);}});});`,
       ),
     );
   }
@@ -336,11 +468,19 @@ export class Studio {
       cause = e;
     }
     const app = this.appPath;
-    await access(join(app, "Contents/MacOS/Screen Studio"));
+    await access(join(app, "Contents/MacOS/Screen Studio")).catch(() => {
+      throw new Error(
+        `Screen Studio was not found at ${app}. Install Screen Studio.app or set SCREENSTUDIO_APP_PATH.`,
+      );
+    });
     // Never restart or kill a running app: Electron's singleton may ignore these flags.
     const running = await this.running();
     if (running) throw new Error(runningAppError(running, fixed, cause));
-    const port = await launchPort(fixed);
+    const preferred = process.env.SCREENSTUDIO_LAUNCH_PORT;
+    const launchFixed = fixed ?? (preferred ? Number(preferred) : null);
+    if (launchFixed !== null && (!Number.isInteger(launchFixed) || launchFixed < 1024 || launchFixed > 65535))
+      throw new Error("SCREENSTUDIO_LAUNCH_PORT must be a port between 1024 and 65535.");
+    const port = await launchPort(launchFixed);
     // Through LaunchServices, like a double-click: the app keeps its own Screen Recording
     // and microphone permissions instead of borrowing those of the terminal or agent app.
     await exec(
@@ -380,16 +520,41 @@ export class Studio {
     }
     return { quit: false, note: "Screen Studio is still open; it may be asking about unsaved changes." };
   }
+  private async distModuleUrl(chunk: string) {
+    await this.running();
+    const base = this.runningAppPath ?? this.appPath;
+    return pathToFileURL(join(base, "Contents/Resources/app.asar/dist", chunk)).href;
+  }
   async state() {
     await this.requireVersion("read");
-    return this.subscription("capture.currentSessionState");
+    const url = await this.distModuleUrl(NATIVE_CLIENT_CHUNK);
+    return this.evaluate(
+      `const nc = (await import(${j(url)}))[${j(NATIVE_CLIENT_EXPORT)}];
+       if (!nc.recording.current && !window.__ssmcpRecordingSubscribed) {
+         window.__ssmcpRecordingWarmup ??= (async () => {
+           for (let i = 0; i < 10; i++) {
+             if (nc.recording.current) break;
+             await new Promise((r) => setTimeout(r, 25));
+           }
+           window.__ssmcpRecordingSubscribed = true;
+         })().finally(() => {
+           window.__ssmcpRecordingWarmup = null;
+         });
+         await window.__ssmcpRecordingWarmup;
+       }
+       return nc.recording.current;`,
+    );
   }
   async sources() {
     await this.requireVersion("read");
-    return {
-      devices: await this.subscription("capture.inputDiscovery"),
-      windows: await this.call("query", "windows.capturableWindows"),
-    };
+    const ncUrl = await this.distModuleUrl(NATIVE_CLIENT_CHUNK);
+    const inputsUrl = await this.distModuleUrl(INPUTS_CHUNK);
+    return this.evaluate(
+      `const nc = (await import(${j(ncUrl)}))[${j(NATIVE_CLIENT_EXPORT)}];
+       const inputs = (await import(${j(inputsUrl)}))[${j(INPUTS_EXPORT)}];
+       const [devices, windows] = await Promise.all([inputs.waitForReady(), nc.windows.listCapturableWindows()]);
+       return { devices, windows };`,
+    );
   }
   async start(input: {
     windowId?: number;
@@ -398,52 +563,125 @@ export class Studio {
     name: string;
     microphoneDeviceId?: string;
     cameraDeviceId?: string;
+    externalDeviceId?: string;
     systemAudio?: boolean;
+    hideDesktopIcons?: boolean;
   }) {
     return this.lock(async () => {
       await this.requireVersion();
       if (await this.state()) throw new Error("A recording is already active. Inspect it before continuing.");
-      if ((input.windowId === undefined) === (input.displayId === undefined))
-        throw new Error("Select exactly one window or display.");
+      const targetsCount = [input.windowId, input.displayId, input.externalDeviceId].filter(
+        (v) => v !== undefined,
+      ).length;
+      if (targetsCount !== 1) throw new Error("Select exactly one window, display, or external device.");
       const sources = await this.sources();
       if (input.windowId !== undefined && !sources.windows.some((w: any) => w.id === input.windowId))
         throw new Error("Recording window is no longer available.");
       if (
         input.displayId !== undefined &&
-        !sources.devices.displays.some((d: any) => d.displayID === input.displayId)
+        !sources.devices.displays.some((d: any) => (d.displayId ?? d.displayID) === input.displayId)
       )
         throw new Error("Display is no longer available.");
+      if (
+        input.externalDeviceId !== undefined &&
+        !(sources.devices.externalDevices ?? []).some(
+          (d: any) => (d.deviceId ?? d.id) === input.externalDeviceId,
+        )
+      )
+        throw new Error("External capture device is no longer available.");
       const config = {
         windowId: input.windowId ?? null,
         displayId: input.displayId ?? null,
         bounds: input.area ?? null,
         microphoneDeviceId: input.microphoneDeviceId ?? null,
         cameraDeviceId: input.cameraDeviceId ?? null,
-        externalDeviceId: null,
+        externalDeviceId: input.externalDeviceId ?? null,
         recordSystemAudio: input.systemAudio ? { type: "all" } : null,
         enableScreenCaptureKit: true,
-        hideDesktopIcons: false,
+        hideDesktopIcons: input.hideDesktopIcons ?? false,
         name: input.name,
       };
-      const started = await this.call("mutation", "capture.start", { config, defaultConfig: {} }, 60000);
+      const ncUrl = await this.distModuleUrl(NATIVE_CLIENT_CHUNK);
+      const started = await this.evaluate(
+        `const nc = (await import(${j(ncUrl)}))[${j(NATIVE_CLIENT_EXPORT)}];
+         const prepared = await bridge.client.mutation("capture.prepareRecording", { config: ${j(config)}, defaultConfig: {} });
+         if (!prepared) throw new Error("Screen Studio did not prepare the recording.");
+         return nc.recording.start(prepared);`,
+        60000,
+      );
       return { started, state: await this.state() };
     });
   }
-  async recordingAction(action: "pause" | "resume" | "finish" | "addMarker" | "restart" | "cancel") {
+  async recordingAction(
+    action: "pause" | "resume" | "finish" | "addMarker" | "restart" | "cancel",
+    expectedRecordingPath?: string,
+  ) {
     return this.lock(async () => {
       await this.requireVersion();
       const state = await this.state();
       if (!state) throw new Error("No recording is active.");
-      const type = state.type ?? state.recordingState?.type;
+      if (expectedRecordingPath && state.outputDirectory !== expectedRecordingPath)
+        throw new Error("The active recording is not the expected recording; it was left untouched.");
+      const type = state.phase ?? state.type ?? state.recordingState?.type;
       if (action === "pause" && type !== "recording")
         throw new Error("Recording must be running before pausing.");
       if (action === "resume" && type !== "paused")
         throw new Error("Recording must be paused before resuming.");
-      const result = await this.call("mutation", `capture.${action}`, undefined, 120000);
+      const recordingPath = typeof state.outputDirectory === "string" ? state.outputDirectory : undefined;
+      const ncUrl = await this.distModuleUrl(NATIVE_CLIENT_CHUNK);
+      let result: any;
+      try {
+        result = await this.evaluate(
+          `const nc = (await import(${j(ncUrl)}))[${j(NATIVE_CLIENT_EXPORT)}];
+           if (${j(action)} !== "finish") return await nc.recording[${j(action)}]();
+           const recordingPath = ${j(recordingPath ?? null)};
+           let res;
+           try {
+             res = await nc.recording.finish();
+           } catch (e) {
+             if (e instanceof Error && e.name === "SwiftServiceRestartedError" && recordingPath) {
+               const recovered = await bridge.client.mutation("capture.recover.tryToRecoverRecording", { path: recordingPath });
+               return recovered
+                 ? { error: "The recorder stopped unexpectedly.", ...recovered, type: "recovered-from-error" }
+                 : { type: "finalization-failed", recordingPath, error: "The recorder process ended while finishing and could not auto-recover." };
+             }
+             throw e;
+           }
+           if (res?.finalizationError) return { type: "finalization-failed", recordingPath, error: res.finalizationError };
+           try {
+             const created = await bridge.client.mutation("capture.createProjectFromRecording", { recording: res });
+             return res?.endProblem
+               ? { type: "recovered-from-error", error: res.endProblem.message, ...created }
+               : { type: "success", ...created };
+           } catch (e) {
+             return { type: "finalization-failed", recordingPath, error: e?.message ?? String(e) };
+           }`,
+          120000,
+        );
+      } catch (e: any) {
+        if (action !== "finish") throw e;
+        const msg = e instanceof Error ? e.message : String(e);
+        const hint = recordingPath
+          ? ` Recording folder: ${recordingPath}. Do not retry finish blindly; inspect screenstudio_record_state and use screenstudio_record_recover (list/recover).`
+          : " Do not retry finish blindly; inspect screenstudio_record_state and screenstudio_record_recover.";
+        throw new Error(`${msg}${hint}`);
+      }
       if (action === "finish") {
-        if (result?.type !== "success" || !result.projectPath)
-          throw new Error(`Recording did not produce a project: ${j(result)}`);
+        if ((result?.type !== "success" && result?.type !== "recovered-from-error") || !result.projectPath) {
+          const recPath = result?.recordingPath ?? recordingPath;
+          const hint = recPath
+            ? ` Inspect or recover it with screenstudio_record_recover (action: "list" or "recover", recordingPath: ${recPath}) rather than retrying finish.`
+            : " Inspect unfinished recordings with screenstudio_record_recover.";
+          throw new Error(`Recording did not produce a project: ${j(result)}.${hint}`);
+        }
         await this.path(result.projectPath);
+        if (result.type === "recovered-from-error") {
+          return {
+            ...result,
+            recovered: true,
+            warning: result.error ?? "Recording ended with an error and was recovered.",
+          };
+        }
         return result;
       }
       return { result, state: await this.state() };
@@ -461,42 +699,59 @@ export class Studio {
   async readProject(path: string) {
     await this.requireVersion("read");
     const projectPath = await this.path(path);
+    await assertProjectBundle(projectPath);
     const data = await this.call("query", "project.readProject", {
       projectPath,
     });
     if (data.projectData?.version !== PROJECT_SCHEMA) throw new Error("Project schema is unsupported.");
     return { projectPath, project: data.projectData };
   }
+  private async checkDestination(source: string, destination: string) {
+    if (!isAbsolute(destination) || !destination.endsWith(".screenstudio"))
+      throw new Error("Destination must be an absolute .screenstudio path.");
+    const resolved = resolve(destination);
+    if (await lstat(resolved).catch(() => null)) throw new Error(`Destination already exists: ${resolved}.`);
+    const canonSource = await canonicalPath(source);
+    const canonical = await canonicalPath(resolved);
+    if (canonical === canonSource || canonical.startsWith(canonSource + "/"))
+      throw new Error("Destination cannot be inside the source project.");
+    return resolved;
+  }
   async duplicate(path: string, destination: string) {
     return this.lock(async () => {
       const source = await this.path(path);
-      if (!isAbsolute(destination) || !destination.endsWith(".screenstudio"))
-        throw new Error("Destination must be an absolute .screenstudio path.");
-      if (resolve(destination).startsWith(source + "/"))
-        throw new Error("Destination cannot be inside the source project.");
-      await cp(source, destination, {
+      await assertProjectBundle(source);
+      const dest = await this.checkDestination(source, destination);
+      await cp(source, dest, {
         recursive: true,
         errorOnExist: true,
         force: false,
       });
-      return this.readProject(destination);
+      return this.readProject(dest);
     });
   }
   async exportStart(
     path: string,
     outputPath: string,
-    options: { height: number; fps: number; format: string; quality: string; keepRender?: boolean },
+    options: ExportOptions,
     live?: (projectPath: string) => Promise<any | null>,
+    expectedEditFingerprint?: string,
   ) {
     return this.lock(async () => {
-      outputPath = this.checkOutput(outputPath, options.format);
-      await assertOutputWritable(outputPath);
+      await this.requireVersion();
+      validateExportOptions(options);
+      const targets = this.checkOutput(outputPath, options);
+      await Promise.all(targets.map((t) => assertOutputWritable(t)));
       const p = await this.readProject(path);
       // Render what the editor shows, including unsaved edits. A failed lookup must abort the
       // export rather than quietly render the saved copy.
       const current = live ? await live(p.projectPath) : null;
       if (current) p.project = current;
-      return this.render(p, outputPath, options, current ? "live" : "disk");
+      if (expectedEditFingerprint && projectEditFingerprint(p.project) !== expectedEditFingerprint)
+        throw new Error(
+          "Project changed after the reviewed edit; inspect and repeat privacy review before exporting.",
+        );
+      return this.render(p, targets, options, current ? "live" : "disk");
     });
   }
   /**
@@ -506,45 +761,71 @@ export class Studio {
   async startRender(
     path: string,
     outputPath: string,
-    options: { height: number; fps: number; format: string; quality: string; keepRender?: boolean },
+    options: ExportOptions,
     projectData: any,
     source: "live" | "disk",
   ) {
     return this.lock(async () => {
-      outputPath = this.checkOutput(outputPath, options.format);
-      await assertOutputWritable(outputPath);
+      await this.requireVersion();
+      validateExportOptions(options);
+      const targets = this.checkOutput(outputPath, options);
+      await Promise.all(targets.map((t) => assertOutputWritable(t)));
       const p = await this.readProject(path);
       if (projectData?.version !== PROJECT_SCHEMA || !Array.isArray(projectData.scenes))
         throw new Error("Project data to render has an unsupported schema.");
-      return this.render({ projectPath: p.projectPath, project: projectData }, outputPath, options, source);
+      return this.render({ projectPath: p.projectPath, project: projectData }, targets, options, source);
     });
   }
-  private checkOutput(outputPath: string, format: string) {
-    if (!isAbsolute(outputPath) || !outputPath.endsWith("." + format))
-      throw new Error("Output must be an absolute path with matching extension.");
-    outputPath = resolve(outputPath);
-    for (const job of this.jobs.values())
-      if (job.outputPath === outputPath && !job.completed && RUNNING.includes(job.status))
+  private checkOutput(outputPath: string, options: Pick<ExportOptions, "format" | "mp4Codec">) {
+    const ext = exportExtension(options.format);
+    if (!isAbsolute(outputPath) || !outputPath.endsWith("." + ext))
+      throw new Error(
+        options.format === "prores"
+          ? "Output must be an absolute path ending in .mov for prores exports."
+          : "Output must be an absolute path with matching extension.",
+      );
+    const resolved = resolve(outputPath);
+    const targets =
+      options.format === "mp4" && options.mp4Codec === "both"
+        ? Object.values(dualMp4Paths(resolved))
+        : [resolved];
+    for (const job of this.jobs.values()) {
+      if (job.completed || !RUNNING.includes(job.status)) continue;
+      const busy = new Set(job.outputPaths ?? [job.outputPath]);
+      if (targets.some((t) => busy.has(t)))
         throw new Error("Another export is already writing to this output; choose a new destination.");
-    return outputPath;
+    }
+    return targets;
   }
   private async render(
     p: { projectPath: string; project: any },
-    outputPath: string,
-    options: { height: number; fps: number; format: string; quality: string; keepRender?: boolean },
+    targets: string[],
+    options: ExportOptions,
     source: "live" | "disk",
   ) {
-    const { keepRender, ...render } = options;
+    const { keepRender, mp4Codec, proResProfile, gifDisableLoop, ...render } = options;
     const jobId = randomUUID();
-    const config = {
+    const config: Record<string, unknown> = {
       ...render,
       target: "file",
       qa: true,
-      mp4Codec: "h264",
       projectPath: p.projectPath,
       projectData: p.project,
+      ...(options.format === "mp4" && { mp4Codec: mp4Codec ?? "h264" }),
+      ...(options.format === "prores" && proResProfile !== undefined && { proResProfile }),
+      ...(options.format === "gif" && gifDisableLoop !== undefined && { gifDisableLoop }),
     };
-    this.jobs.set(jobId, { outputPath, format: options.format, source, keepRender, status: "starting" });
+    this.jobs.set(jobId, {
+      projectPath: await canonicalPath(p.projectPath),
+      editFingerprint: projectEditFingerprint(p.project),
+      outputPath: targets[0],
+      ...(targets.length > 1 && { outputPaths: targets }),
+      format: options.format,
+      ...(options.format === "mp4" && mp4Codec && { mp4Codec }),
+      source,
+      keepRender,
+      status: "starting",
+    });
     await this.saveJob(jobId);
     await withSession(await this.port(), (c) =>
       c.evaluate(
@@ -554,7 +835,8 @@ export class Studio {
     return {
       jobId,
       status: "starting",
-      outputPath,
+      outputPath: targets[0],
+      ...(targets.length > 1 && { outputPaths: targets }),
       source,
       ...(source === "disk" && {
         note: "No open editor has this project, so the saved project is rendered; unsaved edits are not included.",
@@ -596,6 +878,25 @@ export class Studio {
       if (!saved.completed) await this.exportStatus(m[1]).catch(() => {});
     }
   }
+  async findExport(projectPath: string, outputPath: string) {
+    const project = await canonicalPath(projectPath);
+    const output = await canonicalPath(outputPath);
+    const matches: { jobId: string; editFingerprint?: string }[] = [];
+    for (const name of await readdir(this.stateDir).catch(() => [] as string[])) {
+      const m = /^export-([0-9a-f-]{36})\.json$/.exec(name);
+      if (!m) continue;
+      const saved: ExportJob = JSON.parse(await readFile(join(this.stateDir, name), "utf8"));
+      if (
+        saved.projectPath &&
+        (await canonicalPath(saved.projectPath)) === project &&
+        (await canonicalPath(saved.outputPath)) === output
+      )
+        matches.push({ jobId: m[1], editFingerprint: saved.editFingerprint });
+    }
+    if (matches.length > 1)
+      throw new Error("More than one export matches this destination; inspect the saved jobs.");
+    return { found: matches.length === 1, ...(matches[0] ?? {}) };
+  }
   async exportStatus(jobId: string) {
     return this.lock(() => this.deliverExport(jobId));
   }
@@ -609,9 +910,13 @@ export class Studio {
     );
     local.status = job.status;
     if (job.status !== "completed") return { jobId, ...job, source: local.source };
+    if (local.format === "mp4" && local.mp4Codec === "both") {
+      return this.deliverDualExport(jobId, job, local);
+    }
     if (!local.delivered) {
       const dir = await this.call<string>("query", "export.getTempQaExportsPath");
-      const candidates = (await readdir(dir)).filter((f) => f.endsWith(`-${job.exportId}.${local.format}`));
+      const ext = exportExtension(local.format);
+      const candidates = (await readdir(dir)).filter((f) => f.endsWith(`-${job.exportId}.${ext}`));
       if (candidates.length !== 1) throw new Error("Completed export file could not be uniquely located.");
       const rendered = join(dir, candidates[0]);
       try {
@@ -647,7 +952,109 @@ export class Studio {
       await rm(local.renderedPath, { force: true }).catch(() => {});
     return local.completed;
   }
+  private async deliverDualExport(jobId: string, job: any, local: ExportJob) {
+    const dir = await this.call<string>("query", "export.getTempQaExportsPath");
+    const entries = await readdir(dir);
+    const pairs: Array<readonly ["h264" | "h265", string]> = [
+      ["h264", local.outputPaths?.[0] ?? local.outputPath],
+      ["h265", local.outputPaths?.[1] ?? local.outputPath.replace(/-h264\.mp4$/, "-h265.mp4")],
+    ];
+    local.deliveredCodecs ??= {};
+    const errors: Record<string, string> = {};
+    const renderedPaths: string[] = [];
+    const deliveredRenders: string[] = [];
+    const findCodecFile = (codec: "h264" | "h265") => {
+      const tagged = entries.filter((f) => f.endsWith(`-${job.exportId}-${codec}.mp4`));
+      // Screen Studio writes the primary H.264 file without a codec suffix when rendering both codecs.
+      if (tagged.length > 0 || codec !== "h264") return tagged;
+      return entries.filter((f) => f.endsWith(`-${job.exportId}.mp4`));
+    };
+    for (const [codec, out] of pairs) {
+      const prior = local.deliveredCodecs[codec];
+      if (prior) {
+        renderedPaths.push(prior.renderedPath);
+        deliveredRenders.push(prior.renderedPath);
+        await rm(partialPath(prior.outputPath, `${jobId}-${codec}`), { force: true }).catch(() => {});
+        continue;
+      }
+      const matches = findCodecFile(codec);
+      if (matches.length !== 1) {
+        errors[codec] = `Completed ${codec} export file could not be uniquely located.`;
+        continue;
+      }
+      const rendered = join(dir, matches[0]);
+      renderedPaths.push(rendered);
+      try {
+        await deliverFile(rendered, out, `${jobId}-${codec}`);
+        local.deliveredCodecs[codec] = { outputPath: out, renderedPath: rendered };
+        deliveredRenders.push(rendered);
+        // Persist delivery before deleting the cross-volume partial link so retries never hit EEXIST.
+        await this.saveJob(jobId);
+        await rm(partialPath(out, `${jobId}-${codec}`), { force: true });
+      } catch (e: any) {
+        errors[codec] = e instanceof Error ? e.message : String(e);
+      }
+    }
+    const deliveredCodecs = pairs.map(([c]) => c).filter((c) => local.deliveredCodecs?.[c] !== undefined);
+    if (!deliveredCodecs.length) {
+      local.completed = {
+        jobId,
+        status: "delivery_failed",
+        error: Object.values(errors).join("; "),
+        renderedPaths,
+        outputPaths: pairs.map(([, out]) => out),
+        source: local.source,
+      };
+      await this.saveJob(jobId);
+      return local.completed;
+    }
+    const files: Record<string, any> = {};
+    const probeErrors: Record<string, string> = {};
+    let primaryOut: string | undefined;
+    let primaryMedia: any;
+    for (const codec of deliveredCodecs) {
+      const out = local.deliveredCodecs[codec]!.outputPath;
+      try {
+        const media = await this.probe(out);
+        files[codec] = { outputPath: out, media };
+        if (!primaryOut) {
+          primaryOut = out;
+          primaryMedia = media;
+        }
+      } catch (e: any) {
+        const msg = e instanceof Error ? e.message : String(e);
+        probeErrors[codec] = msg;
+        files[codec] = { outputPath: out };
+        errors[codec] = `Delivered, but media inspection failed: ${msg}`;
+      }
+    }
+    if (Object.keys(probeErrors).length === deliveredCodecs.length) {
+      throw new Error(Object.values(probeErrors).join("; "));
+    }
+    const outputPaths = deliveredCodecs.map((c) => local.deliveredCodecs![c]!.outputPath);
+    if (!primaryOut) primaryOut = outputPaths[0];
+    const keptRenderPaths = local.keepRender
+      ? renderedPaths
+      : renderedPaths.filter((p) => !deliveredRenders.includes(p));
+    local.delivered = true;
+    local.completed = {
+      jobId,
+      status: "completed",
+      outputPath: primaryOut,
+      outputPaths,
+      files,
+      source: local.source,
+      ...(primaryMedia !== undefined && { media: primaryMedia }),
+      ...(keptRenderPaths.length > 0 && { renderedPaths: keptRenderPaths }),
+      ...(Object.keys(errors).length > 0 && { warnings: errors }),
+    };
+    await this.saveJob(jobId);
+    // A render whose delivery failed is kept so its file is not lost; its path is in renderedPaths.
+    if (!local.keepRender) for (const p of deliveredRenders) await rm(p, { force: true }).catch(() => {});
+    return local.completed;
+  }
   async exportCancel(jobId: string) {
+    await this.requireVersion();
     await this.getJob(jobId);
     const job = await withSession(await this.port(), (c) =>
       c.evaluate<any>(`return window.__screenstudioMcpJobs?.[${j(jobId)}]??null;`),
@@ -677,5 +1084,266 @@ export class Studio {
       );
     });
     return { path: output, data };
+  }
+  async supportedMicrophonePresets(): Promise<string[]> {
+    await this.requireVersion("read");
+    return this.call<string[]>("query", "media.supportedMicrophoneAudioPresets");
+  }
+  async recentProjects() {
+    await this.requireVersion("read");
+    return this.subscription<Array<{ path: string; lastOpenedAt?: number; [k: string]: unknown }>>(
+      "recentProjects.list",
+    );
+  }
+  async userAudioTracks() {
+    await this.requireVersion("read");
+    return this.subscription<any[]>("backgroundAudio.userLibraryTracks");
+  }
+  private async resolveListedPath(
+    entries: Array<{ path?: unknown }>,
+    rawPath: string,
+  ): Promise<string | null> {
+    const wanted = await realpath(rawPath).catch(() => resolve(rawPath));
+    for (const entry of entries) {
+      const p = entry?.path;
+      if (typeof p !== "string") continue;
+      const candidate = await realpath(p).catch(() => resolve(p));
+      if (candidate === wanted) return p;
+    }
+    return null;
+  }
+  async luts(action: "list" | "add" | "remove", input?: { sourcePath?: string; lutPath?: string }) {
+    if (action === "list") {
+      await this.requireVersion("read");
+      return this.subscription<Array<{ name: string; path: string }>>("luts.userLibrary");
+    }
+    return this.lock(async () => {
+      await this.requireVersion();
+      if (action === "add") {
+        if (!input?.sourcePath || !isAbsolute(input.sourcePath))
+          throw new Error("sourcePath must be an absolute path to a .cube LUT file.");
+        const sourcePath = resolve(input.sourcePath);
+        if (!sourcePath.toLowerCase().endsWith(".cube"))
+          throw new Error("LUT file must use the .cube extension.");
+        if (!(await stat(sourcePath).catch(() => null))?.isFile())
+          throw new Error(`No file found at ${sourcePath}.`);
+        return this.call("mutation", "luts.addToLibrary", { sourcePath });
+      }
+      if (!input?.lutPath || !isAbsolute(input.lutPath))
+        throw new Error("lutPath must be the absolute library LUT path to remove.");
+      const library = await this.subscription<Array<{ name: string; path: string }>>("luts.userLibrary");
+      const target = await this.resolveListedPath(library, input.lutPath);
+      if (!target) throw new Error(`No user library LUT at ${resolve(input.lutPath)}. List user LUTs first.`);
+      const res = await this.call("mutation", "luts.removeFromLibrary", { lutPath: target });
+      return res && typeof res === "object" ? res : { removed: true, lutPath: target };
+    });
+  }
+  async importVideo(videoPath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      if (!isAbsolute(videoPath)) throw new Error("videoPath must be an absolute file path.");
+      const resolved = resolve(videoPath);
+      if (!(await stat(resolved).catch(() => null))?.isFile())
+        throw new Error(`No video file at ${resolved}.`);
+      const res = await this.call<any>("mutation", "import.createProjectFromVideo", {
+        videoPath: resolved,
+      });
+      if (!res?.projectPath)
+        throw new Error("Screen Studio did not return a projectPath for the imported video.");
+      return res;
+    });
+  }
+  async unfinishedRecordings() {
+    await this.requireVersion("read");
+    return this.call<Array<{ path: string; [k: string]: unknown }>>(
+      "query",
+      "capture.recover.unfinishedRecordings",
+    ).catch((e) => {
+      if (/subscription|not supported for query|unsupported method/i.test(String(e)))
+        return this.subscription("capture.recover.unfinishedRecordings");
+      throw e;
+    });
+  }
+  async recoverRecording(recordingPath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      if (!isAbsolute(recordingPath)) throw new Error("recordingPath must be an absolute folder path.");
+      const path = resolve(recordingPath);
+      if (!(await stat(path).catch(() => null))?.isDirectory())
+        throw new Error(`No unfinished recording directory at ${path}.`);
+      const pending = await this.unfinishedRecordings();
+      const entry = await this.resolveListedPath(pending, path);
+      if (!entry)
+        throw new Error(`No unfinished recording matching ${path}. Run list first to get an active path.`);
+      const res = await this.call<unknown>("mutation", "capture.recover.tryToRecoverRecording", {
+        path: entry,
+      });
+      if (!res) throw new Error(`Screen Studio could not recover the recording at ${entry}.`);
+      return res;
+    });
+  }
+  async discardUnfinishedRecording(recordingPath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      if (!isAbsolute(recordingPath)) throw new Error("recordingPath must be an absolute folder path.");
+      const path = resolve(recordingPath);
+      if (!(await stat(path).catch(() => null))?.isDirectory())
+        throw new Error(`No unfinished recording directory at ${path}.`);
+      const pending = await this.unfinishedRecordings();
+      const entry = await this.resolveListedPath(pending, path);
+      if (!entry)
+        throw new Error(`No unfinished recording matching ${path}. Run list first to get an active path.`);
+      const res = await this.call("mutation", "capture.recover.discardUnfinishedRecording", { path: entry });
+      return res && typeof res === "object" ? res : { discarded: true, path: entry };
+    });
+  }
+  async copyFileToProject(projectPath: string, sourcePath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      const project = await this.path(projectPath);
+      await assertProjectBundle(project);
+      if (!isAbsolute(sourcePath)) throw new Error("sourcePath must be an absolute file path.");
+      const source = resolve(sourcePath);
+      if (!(await stat(source).catch(() => null))?.isFile())
+        throw new Error(`No source file found at ${source}.`);
+      return this.call<string>("mutation", "project.copyFileToProject", {
+        projectPath: project,
+        sourcePath: source,
+      });
+    });
+  }
+  async removeAssetFromProject(
+    projectPath: string,
+    assetFile: string,
+    ensureUnused?: (resolvedProject: string, diskData: any) => Promise<void>,
+  ) {
+    if (!assetFile || assetFile !== basename(assetFile) || assetFile.startsWith("."))
+      throw new Error("assetFile must be a bare asset file name from the project's assets, not a path.");
+    return this.projectLock(projectPath, () =>
+      this.lock(async () => {
+        await this.requireVersion();
+        const project = await this.path(projectPath);
+        const diskData = await assertProjectBundle(project);
+        if (ensureUnused) {
+          await ensureUnused(project, diskData);
+        } else {
+          const refs = findAssetReferences(diskData, assetFile);
+          if (refs.length)
+            throw new Error(
+              `Asset "${assetFile}" is still referenced by ${refs.join(", ")}. Clear those settings before removing it.`,
+            );
+        }
+        return this.call("mutation", "project.removeAssetFromProject", {
+          projectPath: project,
+          assetFile,
+        });
+      }),
+    );
+  }
+  async moveProject(
+    projectPath: string,
+    destinationPath: string,
+    ensureClosed?: (resolvedSource: string) => Promise<void>,
+  ) {
+    return this.projectLock(projectPath, () =>
+      this.lock(async () => {
+        await this.requireVersion();
+        const source = await this.path(projectPath);
+        await assertProjectBundle(source);
+        const dest = await this.checkDestination(source, destinationPath);
+        await ensureClosed?.(source);
+        await this.call("mutation", "project.moveProject", { projectPath: source, destinationPath: dest });
+        return { projectPath: dest, movedFrom: source };
+      }),
+    );
+  }
+  async copyProject(projectPath: string, destinationPath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      const source = await this.path(projectPath);
+      await assertProjectBundle(source);
+      const dest = await this.checkDestination(source, destinationPath);
+      await this.call("mutation", "project.copyProject", { projectPath: source, destinationPath: dest });
+      return { projectPath: dest, copiedFrom: source };
+    });
+  }
+  async removeProject(projectPath: string, ensureClosed?: (resolvedSource: string) => Promise<void>) {
+    return this.projectLock(projectPath, () =>
+      this.lock(async () => {
+        await this.requireVersion();
+        const linkInfo = await lstat(projectPath).catch(() => null);
+        if (linkInfo?.isSymbolicLink())
+          throw new Error(
+            "Refusing to remove a symlinked project path directly; pass the real .screenstudio bundle.",
+          );
+        const source = await this.path(projectPath);
+        if (!source.endsWith(".screenstudio"))
+          throw new Error(`Not a Screen Studio project (${source} does not end with .screenstudio).`);
+        const raw = await readFile(join(source, "project.json"), "utf8").catch(() => null);
+        if (raw === null) throw new Error(`Not a Screen Studio project (missing project.json in ${source}).`);
+        let parsed: any;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          throw new Error(`Not a Screen Studio project (corrupted project.json in ${source}).`);
+        }
+        const data = parsed?.json ?? parsed;
+        if (
+          !data ||
+          typeof data !== "object" ||
+          typeof data.version !== "string" ||
+          ((!data.config || typeof data.config !== "object") && !Array.isArray(data.scenes))
+        ) {
+          throw new Error(`Not a Screen Studio project (unrecognized project.json structure in ${source}).`);
+        }
+        await ensureClosed?.(source);
+        await this.call("mutation", "project.removeProject", { projectPath: source });
+        return { removed: true, projectPath: source };
+      }),
+    );
+  }
+  async extractRawRecordingFiles(projectPath: string, outputFolderPath: string) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      const source = await this.path(projectPath);
+      await assertProjectBundle(source);
+      if (!isAbsolute(outputFolderPath)) throw new Error("outputFolderPath must be an absolute directory.");
+      const out = resolve(outputFolderPath);
+      if (!(await stat(out).catch(() => null))?.isDirectory())
+        throw new Error(`Output folder does not exist: ${out}.`);
+      const canonSource = await canonicalPath(source);
+      const canonOut = await canonicalPath(out);
+      if (canonOut === canonSource || canonOut.startsWith(`${canonSource}/`))
+        throw new Error("Output folder cannot be inside the .screenstudio project bundle.");
+      await access(out, constants.W_OK).catch(() => {
+        throw new Error(`Output folder is not writable: ${out}.`);
+      });
+      await this.call("mutation", "project.extractRawRecordingFiles", {
+        projectPath: source,
+        outputFolderPath: out,
+      });
+      return { projectPath: source, outputFolderPath: out };
+    });
+  }
+  async windowAction(windowId: number, action: "focus" | "resize", size?: { width: number; height: number }) {
+    return this.lock(async () => {
+      await this.requireVersion();
+      const { windows } = await this.sources();
+      const win = windows.find((w: any) => w.id === windowId);
+      if (!win) throw new Error(`Window ${windowId} is not currently available.`);
+      const ncUrl = await this.distModuleUrl(NATIVE_CLIENT_CHUNK);
+      if (action === "resize") {
+        if (!size || !(size.width > 0 && size.height > 0))
+          throw new Error("Resize requires positive width and height.");
+        await this.evaluate(
+          `const nc = (await import(${j(ncUrl)}))[${j(NATIVE_CLIENT_EXPORT)}]; await nc.windows.resizeWindow(${windowId}, ${Math.round(size.width)}, ${Math.round(size.height)}); return true;`,
+        );
+        return { windowId, action, width: Math.round(size.width), height: Math.round(size.height) };
+      }
+      await this.evaluate(
+        `const nc = (await import(${j(ncUrl)}))[${j(NATIVE_CLIENT_EXPORT)}]; await nc.windows.bringWindowToFront(${windowId}); return true;`,
+      );
+      return { windowId, action };
+    });
   }
 }

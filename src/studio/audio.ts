@@ -4,7 +4,7 @@
 // two sentences the level drops into a valley, and a cut in its middle clips
 // nothing.
 import { ffmpegFailure, readRecordingMeta } from "./recording.js";
-import { ffmpeg } from "./media.js";
+import { drainMediaWork, ffmpeg } from "./media.js";
 import type { Span } from "./spans.js";
 
 /** The microphone's level over one frame: `t` is the frame's start in source ms. */
@@ -100,7 +100,7 @@ export async function micLevels(projectPath: string): Promise<{ levels: Level[];
   const { microphone } = await readRecordingMeta(projectPath);
   if (!microphone.length) return { levels: [], unavailable: "the recording has no microphone" };
   try {
-    const parts = await Promise.all(
+    const parts = await drainMediaWork(
       microphone.map(async (m) =>
         parseLevels(
           await ffmpeg(["-nostats", "-i", m.audio, "-vn", "-af", LEVEL_FILTER, "-f", "null", "-"], {

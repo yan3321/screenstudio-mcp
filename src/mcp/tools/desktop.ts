@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Context } from "../context.js";
-import { DESKTOP_INPUT, READ, id, image, toolsOn } from "../tool.js";
+import { DESKTOP_INPUT, READ, WRITE, id, image, toolsOn } from "../tool.js";
 import { HOLD, TOKEN_TTL_MS, desktopAction } from "../../studio/desktop.js";
 
 const holds = (["click", "type", "key", "scroll"] as const).map((k) => `${k} ${HOLD[k] / 1000}s`).join(", ");
@@ -30,7 +30,7 @@ export function register(server: McpServer, { studio, desktop }: Context) {
 
   tool(
     "screenstudio_desktop_action",
-    "One visible native step on an observed window: focus, move, click, doubleClick, drag, taps (a burst of count taps every intervalMs at one point), hold (press for ms, then release), type, key (with modifiers, e.g. {key:'k',modifiers:['command']}; keys follow the person's keyboard layout) or scroll (optional x/y to scroll there; otherwise the pointer stays if it is over the window or moves to its middle). Coordinates are window-local points including the title bar. Pointer glides at a human pace and settles before clicking. Input stops if the window loses focus, another window covers the point or the pointer is moved. Some apps (terminals, password managers, System Settings) are excluded unless SCREENSTUDIO_ALLOW_APPS names them. System shortcuts (command+space, command+tab, command+q) are not sent.",
+    "One visible native step on an observed window: focus, move, click, doubleClick, drag, taps (a burst of count taps every intervalMs at one point), hold (press for ms, then release), type, key (with modifiers, e.g. {key:'k',modifiers:['command']}; keys follow the person's keyboard layout) or scroll (optional x/y to scroll there; otherwise the pointer stays if it is over the window or moves to its middle). Coordinates are window-local points including the title bar. Pointer glides at a human pace and settles before clicking. Input stops if the window loses focus, another window covers the point or the pointer is moved. Some apps (terminals, password managers, System Settings) are excluded unless SCREENSTUDIO_ALLOW_APPS names them. System shortcuts (command+space, command+tab, command+q) are not sent. type/key return clock, onsetsMs (one primary key-down per grapheme or key), and endAtMs (last key-up, including modifiers; null if none). These are native injection times, not UI paint times; failures include partial timing in a second text block.",
     {
       observationToken: z.string().uuid(),
       action: desktopAction,
@@ -42,7 +42,7 @@ export function register(server: McpServer, { studio, desktop }: Context) {
 
   tool(
     "screenstudio_desktop_perform",
-    `Perform a whole beat in one take while recording: up to 12 steps, each followed by a hold so its result is visible (defaults: ${holds}). One continuous take gives natural pacing; pace 1.3 is calmer. markers:true adds a recording marker before the first step, so screenstudio_analyze and screenstudio_narrate (pinToMarkers) know where the beat starts. minDurationMs stretches the last hold so the beat lasts at least that long (a narration line's durationMs from screenstudio_voice_lines plus about 400ms).`,
+    `Perform a whole beat in one take while recording: up to 12 steps, each followed by a hold so its result is visible (defaults: ${holds}). One continuous take gives natural pacing; pace 1.3 is calmer. markers:true adds a recording marker before the first step, so screenstudio_analyze and screenstudio_narrate (pinToMarkers) know where the beat starts. Step results retain type/key clock, onsetsMs and endAtMs injection timing. minDurationMs stretches the last hold so the beat lasts at least that long (a narration line's durationMs from screenstudio_voice_lines plus about 400ms).`,
     {
       observationToken: z.string().uuid(),
       steps: z
@@ -62,5 +62,28 @@ export function register(server: McpServer, { studio, desktop }: Context) {
         minDurationMs: a.minDurationMs,
         signal: extra.signal,
       }),
+  );
+
+  tool(
+    "screenstudio_window",
+    "Bring a capturable window to front (focus), resize it in points, query OS bounds + backingScaleFactor (bounds), hide Screen Studio immediately (hideScreenStudio), or wait for recording startup UI to stay hidden before native input (settleHidden, up to 10 seconds). Settle stops on desktop input, a new editor, or Screen Studio focus; it never monitors or hides during the take.",
+    {
+      windowId: id.optional(),
+      action: z.enum(["focus", "resize", "bounds", "hideScreenStudio", "settleHidden"]),
+      width: z.number().int().positive().max(10000).optional(),
+      height: z.number().int().positive().max(10000).optional(),
+    },
+    WRITE,
+    async (a) => {
+      if (a.action === "hideScreenStudio") return desktop.hideApp();
+      if (a.action === "settleHidden") return desktop.settleHiddenApp();
+      if (a.windowId === undefined) throw new Error("windowId is required for focus, resize, and bounds.");
+      if (a.action === "bounds") return desktop.bounds(a.windowId);
+      return studio.windowAction(
+        a.windowId,
+        a.action,
+        a.action === "resize" ? { width: a.width ?? 0, height: a.height ?? 0 } : undefined,
+      );
+    },
   );
 }

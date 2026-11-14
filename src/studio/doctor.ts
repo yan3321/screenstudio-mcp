@@ -12,10 +12,9 @@ export async function dependencies() {
   const edge = tts.includes("/") && existsSync(tts) ? tts : null;
   let permissions: { accessibility: boolean; screenRecording: boolean } | null = null;
   if (existsSync(helper))
-    permissions = await exec(helper, ["trust"], { timeout: 15000 }).then(
-      (r) => JSON.parse(r.stdout),
-      () => null,
-    );
+    permissions = await exec(helper, ["trust"], { timeout: 15000 })
+      .then((r) => JSON.parse(r.stdout))
+      .catch(() => null);
   return {
     ffmpeg: await locateTool("ffmpeg"),
     ffprobe: await locateTool("ffprobe"),

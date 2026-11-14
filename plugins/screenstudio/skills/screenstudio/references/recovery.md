@@ -8,7 +8,7 @@
 | Wrong window/focus changed | Stop input, screenshot and identify the original target again. |
 | Waiting on network or reasoning | Pause, resolve the wait, inspect target, resume. |
 | Finish timed out | Inspect session and project output before retrying. Preserve the project and report uncertainty. |
-| App exited | Keep the unfinished recording. Reopen Screen Studio and use its recovery UI. |
+| App exited | Keep the unfinished recording. Reopen Screen Studio and run `screenstudio_record_recover` (`list`, then `recover` or `discard`). |
 | Lost export connection | Poll the same job after reconnecting. Export job metadata survives server restart; renderer state requires the app to remain open. |
 
 Never infer recording success from a new directory alone. Finish must return a successful saved project. Keep the source until its rendered output has been inspected.

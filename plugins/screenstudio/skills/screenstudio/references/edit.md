@@ -12,6 +12,10 @@ Apply directly by default (`show: false`): the result appears live immediately a
 
 Each apply saves unless `save: false`. Use undo or the returned checkpoint to recover an agent edit; restoring a checkpoint also replaces any later manual changes, so prefer a focused correction when the person has adjusted the project since. Undo, restore, narration and music need `screenstudio_editor_save` afterward.
 
+Check the returned save outcome. `saved:false` or `saveOutcome:unknown` stops the edit/export chain: keep its checkpoint, saveId and instanceId, then inspect `screenstudio_editor_save_observation`. Late completion is separate from the original receipt. Missing observations or a changed renderer nonce do not prove the write stopped. If live timeline inspection is unavailable, retain the operation evidence and inspect again; do not substitute saved disk state as the live result.
+
+Closing with `save:false` closes only a clean editor. Discard dirty work only when the person explicitly asked, using the exact V3 snapshot fingerprint for that authorized content; the tool refuses changed content. Never refresh a discard fingerprint just to bypass unexpected manual edits.
+
 ## Workflow
 
 1. **Use the current window.** `screenstudio_edit_context` returns the focused editor, timeline, full config, editGeneration, and speech/action analysis in one call. Use `analyze: false` for a settings-only tweak. On an older installation without this tool, use status to select the focused editor, then read its state and analyze the same project. Call `screenstudio_status` for connection problems; open a project only when the requested one is not already open. Copy only when asked.

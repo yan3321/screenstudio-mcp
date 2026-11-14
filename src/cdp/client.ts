@@ -9,6 +9,15 @@ interface InFlight {
 const CLOSED_MID_COMMAND =
   "Screen Studio connection closed. Reconnect and inspect state before retrying a change.";
 
+export class CommandNotSentError extends Error {
+  constructor(cause: unknown) {
+    super(
+      `${cause instanceof Error ? cause.message : "The automation session could not open"} This command was not sent.`,
+      { cause },
+    );
+  }
+}
+
 /**
  * One DevTools Protocol session with Screen Studio's editor renderer.
  * Commands are matched to replies by id; every command carries its own deadline.
@@ -45,7 +54,8 @@ export class DevToolsSession {
     timeoutMs = this.defaultTimeoutMs,
   ): Promise<T> {
     const socket = this.socket;
-    if (socket?.readyState !== WebSocket.OPEN) throw new Error("Screen Studio is not connected.");
+    if (socket?.readyState !== WebSocket.OPEN)
+      throw new CommandNotSentError(new Error("Screen Studio is not connected."));
     const id = ++this.lastId;
     return new Promise<T>((resolve, reject) => {
       const deadline = setTimeout(() => {
@@ -153,7 +163,11 @@ export async function withSession<T>(
 ): Promise<T> {
   const session = new DevToolsSession(port);
   try {
-    await session.open();
+    try {
+      await session.open();
+    } catch (error) {
+      throw new CommandNotSentError(error);
+    }
     return await work(session);
   } finally {
     session.close();

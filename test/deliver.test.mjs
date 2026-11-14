@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { offlineTransport } from "./support/stdio.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -458,11 +458,9 @@ test("the variants reference lists every target with its real frame and render",
   }
 });
 
-test("the delivery tools are served and refuse a request without a project", async () => {
+test("the delivery tools are served and refuse a request without a project", async (t) => {
   const client = new Client({ name: "deliver", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const { tools } = await client.listTools();
     const byName = (n) => tools.find((t) => t.name === n);

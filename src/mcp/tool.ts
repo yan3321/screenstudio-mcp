@@ -9,6 +9,7 @@ import type {
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import { DesktopInputError } from "../studio/desktop.js";
 import { DEFAULT_STYLE, STYLE_NAMES } from "../studio/styles.js";
 
 const annotate = ({ readOnly = false, destructive = false, openWorld = false } = {}): ToolAnnotations => ({
@@ -101,6 +102,9 @@ export function toolsOn(server: McpServer): Tool {
             isError: true,
             content: [
               { type: "text" as const, text: error instanceof Error ? error.message : String(error) },
+              ...(error instanceof DesktopInputError
+                ? [{ type: "text" as const, text: JSON.stringify(error.timing) }]
+                : []),
             ],
           };
         }

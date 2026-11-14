@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { offlineTransport } from "./support/stdio.mjs";
 import { RECIPES, RECIPE_NAMES, recipeList, recipeNotes, resolveRecipe } from "../dist/studio/recipes.js";
 import { ASPECTS, LOOKS, STYLE_CONFIG, STYLES } from "../dist/studio/styles.js";
 import { MUSIC, VOICES } from "../dist/studio/narration.js";
@@ -176,11 +176,9 @@ test("overrides merge field by field and unknown fields are refused", () => {
     assert.ok(notes.includes(want), want);
 });
 
-test("the recipes tool lists every recipe and resolves one with overrides", async () => {
+test("the recipes tool lists every recipe and resolves one with overrides", async (t) => {
   const client = new Client({ name: "recipes", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const { tools } = await client.listTools();
     for (const name of ["screenstudio_recipes", "screenstudio_plan_layouts"])

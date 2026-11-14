@@ -107,11 +107,11 @@ Every edit is custom. A preset is an optional starting point: name one in your r
 
 ## Compatibility
 
-Supported: Screen Studio up to 4.0.1 (build 4897), the tested build, on macOS. Reading projects and footage works on any 4.x build. Recording and editing on any other build, older or newer, needs `SCREENSTUDIO_ALLOW_UNTESTED=1`. Turn off Screen Studio's auto-update to stay on the tested build. See [docs/compatibility.md](docs/compatibility.md).
+Supported: Screen Studio up to 4.1.0 (build 5005), the tested build, on macOS. Reading projects and footage works on any 4.x build. Recording and editing on any other build, older or newer, needs `SCREENSTUDIO_ALLOW_UNTESTED=1`. Turn off Screen Studio's auto-update to stay on the tested build. See [docs/compatibility.md](docs/compatibility.md).
 
 ## Requirements
 
-- macOS with [Screen Studio](https://screen.studio) 4. Recording and editing need 4.0.1; see [Compatibility](#compatibility).
+- macOS with [Screen Studio](https://screen.studio) 4. Recording and editing need 4.1.0; see [Compatibility](#compatibility).
 - Node.js 22 or newer.
 - `ffmpeg` and `ffprobe`: `brew install ffmpeg`.
 - Optional, for narration: `edge-tts` (`pipx install edge-tts`). Narration text is sent to Microsoft's online speech service.
@@ -151,7 +151,7 @@ tool_timeout_sec = 1800
 | `SCREENSTUDIO_APP_PATH` | Path to Screen Studio, if it is not in Applications. |
 | `SCREENSTUDIO_PORT` | A fixed automation port (1024 to 65535) instead of a free one. |
 | `SCREENSTUDIO_STATE_DIR` | Where checkpoints, caches, brand kits and your `preferences.md` live. Default `~/.screenstudio-mcp`. |
-| `SCREENSTUDIO_ALLOW_UNTESTED` | `1` allows recording and editing on a Screen Studio 4.x build other than 4.0.1 (build 4897), older or newer. |
+| `SCREENSTUDIO_ALLOW_UNTESTED` | `1` allows recording and editing on a Screen Studio 4.x build other than 4.1.0 (build 5005), older or newer. |
 | `SCREENSTUDIO_ALLOW_APPS` | Comma-separated bundle ids of extra apps the agent may click and type in. Terminals, password managers and System Settings are skipped unless listed here. |
 | `SCREENSTUDIO_FFMPEG`, `SCREENSTUDIO_FFPROBE`, `SCREENSTUDIO_EDGE_TTS` | Paths to those tools, if they are not found automatically. |
 

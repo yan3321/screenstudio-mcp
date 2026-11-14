@@ -10,6 +10,7 @@ import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import type { Studio } from "./service.js";
 import type { Editor } from "./editor/editor.js";
+import { CommandNotSentError } from "../cdp/client.js";
 import { durationMs, exec, ffmpeg } from "./media.js";
 import { appAsar, musicLibrary, readAsar } from "./assets.js";
 import { phrases, spokenWords, writeNarrationTranscript, type Word } from "./transcript.js";
@@ -478,67 +479,64 @@ export function previousTrack(
 /** Audio files these tools put in a project (`<staged name>-<random>.m4a` after the app copies them). */
 const TOOL_AUDIO = /^(narration|music)-\d+-[A-Za-z0-9]+\.m4a$/;
 
-/** Tool-made audio files that nothing references any more. */
+/** Candidates absent from supplied references; this does not prove undo or other readers are finished. */
 export function orphanedAudio(files: string[], referenced: string) {
   return files.filter((f) => TOOL_AUDIO.test(f) && !referenced.includes(f));
 }
 
-/**
- * Deletes earlier narration and music mixes from the project package that
- * neither the live project, the saved project nor an editor checkpoint uses.
- * Runs before a new track is attached, so the track being replaced survives for undo.
- */
-async function sweepAudio(studio: Studio, editor: Editor, path: string, live: unknown) {
-  const assets = join(path, "assets");
-  const files = await readdir(assets).catch(() => [] as string[]);
-  if (!files.some((f) => TOOL_AUDIO.test(f))) return;
-  // What the editor references right now, not when this call started.
-  live = (await editor.liveProject(path).catch(() => null)) ?? live;
-  const saved = await readFile(join(path, "project.json"), "utf8").catch(() => null);
-  if (saved === null) return;
-  const checkpoints = await Promise.all(
-    (await readdir(studio.stateDir).catch(() => [] as string[]))
-      .filter((f) => /^editor-[0-9a-f-]{36}\.json$/.test(f))
-      .map((f) => readFile(join(studio.stateDir, f), "utf8").catch(() => "")),
-  );
-  const referenced = [JSON.stringify(live), saved, ...checkpoints].join("\n");
-  // Tracks from the last hour stay: the app's undo history may still point at them.
-  const old = async (f: string) =>
-    Date.now() -
-      (await stat(join(assets, f)).then(
-        (s) => s.mtimeMs,
-        () => Date.now(),
-      )) >
-    3600_000;
-  for (const f of orphanedAudio(files, referenced))
-    if (await old(f)) await rm(join(assets, f), { force: true });
-}
-
 /** Copies a mixed track into the project and makes it the background audio, like choosing a custom track. */
-async function attachBackgroundAudio(
+export async function attachBackgroundAudio(
   studio: Studio,
   editor: Editor,
   path: string,
-  live: unknown,
   file: string,
   volume: number,
 ) {
+  let fileName: string;
   try {
-    await sweepAudio(studio, editor, path, live);
-    const fileName = await studio.call<string>("mutation", "project.copyFileToProject", {
+    await editor.requireEditable(path);
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : "The editor is unavailable."} No audio was copied. Retained the staged mix at ${file}.`,
+      { cause: error },
+    );
+  }
+  try {
+    fileName = await studio.call<string>("mutation", "project.copyFileToProject", {
       projectPath: path,
       sourcePath: file,
     });
+    if (
+      typeof fileName !== "string" ||
+      !fileName ||
+      [".", ".."].includes(fileName) ||
+      basename(fileName) !== fileName
+    )
+      throw new Error("The native copy did not return a project asset filename.");
+  } catch (error) {
+    if (error instanceof CommandNotSentError) {
+      await rm(file, { force: true });
+      throw error;
+    }
+    throw new Error(
+      `Background audio copy was not confirmed. Retained the staged mix at ${file}; inspect the project before retrying.`,
+      { cause: error },
+    );
+  }
+  try {
     await editor.setAudio(path, {
       backgroundAudioFileName: fileName,
       backgroundAudioVolume: volume,
       muteBackgroundAudio: false,
     });
-    return fileName;
-  } finally {
-    // The project keeps its own copy; the staged mix is not needed again.
-    await rm(file, { force: true });
+  } catch (error) {
+    throw new Error(
+      `Background audio was copied as ${fileName}, but its configuration was not confirmed. Retained the staged mix at ${file}; inspect the live project before retrying.`,
+      { cause: error },
+    );
   }
+  await rm(file, { force: true });
+  return fileName;
 }
 
 /**
@@ -581,6 +579,7 @@ async function musicNow(
   path: string,
   opts: { track: string; volume: number; duckUnderSpeech: boolean; duckTo: number },
 ) {
+  await editor.requireEditable(path);
   const key = shortHash(path);
   const track = resolveMusic(await musicLibrary(studio.appPath), opts.track);
   const live = await openProject(editor, path);
@@ -592,7 +591,7 @@ async function musicNow(
     await readJson<SavedMusic>(musicPath),
   );
   if (previous?.kind === "narration") {
-    const result = await narrate(studio, editor, path, { music: track, musicVolume: opts.volume });
+    const result = await narrateNow(studio, editor, path, { music: track, musicVolume: opts.volume });
     return {
       ...result,
       note: "The audio track holds the narration, so the music was mixed under the voice (ducked by it) instead of replacing it. screenstudio_narrate with music: null removes it.",
@@ -649,7 +648,7 @@ async function musicNow(
     "192k",
     out,
   ]);
-  const fileName = await attachBackgroundAudio(studio, editor, path, live, out, opts.volume);
+  const fileName = await attachBackgroundAudio(studio, editor, path, out, opts.volume);
   await writeFile(musicPath, JSON.stringify({ track, volume: opts.volume, fileName } satisfies SavedMusic), {
     mode: 0o600,
   });
@@ -670,6 +669,7 @@ export async function narrate(studio: Studio, editor: Editor, projectPath: strin
 }
 
 async function narrateNow(studio: Studio, editor: Editor, path: string, req: NarrationRequest) {
+  await editor.requireEditable(path);
   const key = shortHash(path);
   const specPath = join(studio.stateDir, `narration-${key}.json`);
   const musicPath = join(studio.stateDir, `music-${key}.json`);
@@ -786,7 +786,7 @@ async function narrateNow(studio: Studio, editor: Editor, path: string, req: Nar
     "192k",
     out,
   ]);
-  const fileName = await attachBackgroundAudio(studio, editor, path, live, out, 1);
+  const fileName = await attachBackgroundAudio(studio, editor, path, out, 1);
   let caption: Awaited<ReturnType<typeof narrationCaptions>> | null = null;
   const words: CaptionWord[] = [];
   if (captions) {

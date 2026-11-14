@@ -58,4 +58,4 @@ Re-sync keeps captions on and re-times them.
 
 Measure in the export: voice around −20 to −24 dB mean, music alone about 10 dB lower, a silent tail. Listen to the first and last lines and to every line that names a click.
 
-Screen Studio's own AI voiceover and recorded voiceover tracks are disabled in app build 4.0.1-4897, so narration plays as the project's background audio track. It renders in Screen Studio's export like any background music.
+Screen Studio's own AI voiceover and recorded voiceover tracks are disabled in app build 4.1.0-5005, so narration plays as the project's background audio track. It renders in Screen Studio's export like any background music.

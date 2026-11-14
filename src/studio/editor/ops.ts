@@ -1,7 +1,7 @@
 // Editor ops: the schema agents send, and the Node-side checks and conversions
 // that run before anything touches the editor.
 import { z } from "zod";
-import { validateConfigChange } from "../project.js";
+import { validateCombinedConfig, validateConfigChange } from "../project.js";
 import { ms, rect01, unit } from "../schemas.js";
 import { round } from "../timeline.js";
 
@@ -16,9 +16,37 @@ const loupe = z
   .strict();
 const layoutOptions = z
   .object({
-    cameraOverlay: z.object({ overlayCameraPosition01: target }).partial().strict().optional(),
-    cutoutCamera: z.object({ cutoutCameraPositionX01: unit }).partial().strict().optional(),
-    splitScreen: z.record(z.string(), z.unknown()).optional(),
+    cameraOverlay: z
+      .object({
+        overlayCameraPosition01: target,
+        overlayCameraSizeRatio01: unit,
+        overlayCameraPaddingRatio01: unit,
+        overlayCameraAspectRatio: z.number().finite().min(0.2).max(5),
+        overlayZoomedCameraScale: unit,
+      })
+      .partial()
+      .strict()
+      .optional(),
+    cutoutCamera: z
+      .object({
+        cutoutCameraPositionX01: unit,
+        cutoutCameraSizeRatio01: z.number().finite().min(0.1).max(1.5),
+        cutoutCameraZoomedScale: unit,
+        cutoutCameraAspectRatio: z.number().finite().min(0.2).max(5).nullable(),
+      })
+      .partial()
+      .strict()
+      .optional(),
+    splitScreen: z
+      .object({
+        splitDirection: z.enum(["auto", "horizontal", "vertical"]),
+        splitFlip: z.boolean(),
+        splitScreenRatio01: unit.nullable(),
+        enablePadding: z.boolean(),
+      })
+      .partial()
+      .strict()
+      .optional(),
   })
   .strict();
 /** Tracks whose items have ids and source ranges. */
@@ -46,6 +74,8 @@ export const editOp = z.discriminatedUnion("op", [
               endMs: ms,
               speed: z.number().finite().min(0.25).max(8),
               volume: unit.optional(), // above 1 breaks Screen Studio's audio mixing on export
+              systemAudioVolume: unit.optional(),
+              externalDeviceAudioVolume: unit.optional(),
               hideCursor: z.boolean().optional(),
               disableSmoothMouseMovement: z.boolean().optional(),
             })
@@ -83,6 +113,7 @@ export const editOp = z.discriminatedUnion("op", [
       target: target.optional(),
       presentation: z.enum(["screen", "loupe"]).optional(),
       loupe: loupe.optional(),
+      instant: z.boolean().optional(),
     })
     .strict(),
   z.object({ op: z.literal("removeZoom"), zoomId: z.string().min(1) }).strict(),
@@ -172,6 +203,9 @@ export function configPartial(config: any, changes: Record<string, unknown>) {
     node[rest.at(-1)!] = validated;
     partial[group][field] = base;
   }
+  const completed = { ...config };
+  for (const [group, fields] of Object.entries(partial)) completed[group] = { ...config[group], ...fields };
+  validateCombinedConfig(completed, changes);
   return partial;
 }
 

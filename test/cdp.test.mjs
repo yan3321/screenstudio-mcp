@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
-import { DevToolsSession } from "../dist/cdp/client.js";
+import { CommandNotSentError, DevToolsSession, withSession } from "../dist/cdp/client.js";
 import { findRendererPage } from "../dist/cdp/page-finder.js";
 
 async function fixture(t, respond) {
@@ -50,6 +50,23 @@ async function fixture(t, respond) {
   return server.address().port;
 }
 
+test("session discovery failure is typed as not sent before the command callback runs", async (t) => {
+  const server = createServer((_request, response) => {
+    response.setHeader("content-type", "application/json");
+    response.end("[]");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  let called = false;
+  await assert.rejects(
+    withSession(server.address().port, async () => {
+      called = true;
+    }),
+    CommandNotSentError,
+  );
+  assert.equal(called, false);
+});
+
 test("discovery skips the export worker even when it is first", async (t) => {
   const port = await fixture(t, () => {});
   assert.match(await findRendererPage(port), /\/editor$/);
@@ -85,10 +102,10 @@ test("evaluation timeout cleans up and leaves connection usable", async (t) => {
         }),
       );
   });
-  const client = new DevToolsSession(port, { timeoutMs: 30 });
+  const client = new DevToolsSession(port);
   await client.open();
   t.after(() => client.close());
-  await assert.rejects(client.evaluate("return 1;"), /timed out/i);
+  await assert.rejects(client.evaluateAwait("1", 30), /timed out/i);
   assert.equal(await client.evaluate("return 7;"), 7);
 });
 test("renderer exceptions and async rejections reach the caller", async (t) => {

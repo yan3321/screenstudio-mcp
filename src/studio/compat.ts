@@ -1,11 +1,27 @@
 // Everything tied to one Screen Studio build. A new app version starts here.
 
-export const APP_BUILD = "4.0.1-4897";
+export const APP_BUILD = "4.1.0-5005";
 export const PROJECT_SCHEMA = "4.0.0";
 
+// Seeking changes this serialized view preference without creating an edit.
+export const PROJECT_VIEW_DATA_KEYS = ["last-playback-position-source-time-ms"] as const;
+
+/** The tested project.updateProject route acknowledges a successful write with void. */
+export function projectSaveAcknowledged(value: unknown): boolean {
+  return value === undefined;
+}
+
 /** Bundle chunk holding the editor's transcript model, and its minified export. */
-export const TRANSCRIPT_CHUNK = "RS8E8hrv2.js";
-export const TRANSCRIPT_EXPORT = "t";
+export const TRANSCRIPT_CHUNK = "B0echNca.js";
+export const TRANSCRIPT_EXPORT = "b";
+
+/** Bundle chunk holding the native Swift service client, and its minified export. */
+export const NATIVE_CLIENT_CHUNK = "DLnk-cLt.js";
+export const NATIVE_CLIENT_EXPORT = "t";
+
+/** Bundle chunk holding the recording input discovery store, and its minified export. */
+export const INPUTS_CHUNK = "CVCogM-Y2.js";
+export const INPUTS_EXPORT = "t";
 
 export const editorWindowTitle = (projectName: string) => `Project - ${projectName}`;
 
@@ -47,6 +63,14 @@ export const capabilities = {
     narrationCaptions: true,
     voiceLines: true,
     sensitiveTextRedaction: true,
+    customMediaAssets: true,
+    colorGradingLuts: true,
+    externalDeviceCapture: true,
+    proresExport: true,
+    recentProjects: true,
+    recordingRecovery: true,
+    videoImport: true,
+    windowManagement: true,
     exportVariants: true,
     seamlessLoops: true,
     contactSheet: true,
@@ -64,9 +88,9 @@ export const capabilities = {
   ],
   notes: [
     "Unofficial integration. Screen Studio updates may change internal interfaces.",
-    "Caption styling, webcam processing and layout defaults are available as config settings.",
+    "Caption styling, webcam processing/LUTs, cursor rotation and layout defaults are available as config settings.",
     "Screen Studio AI and recorded voiceover tracks are disabled in this app build; narration uses the background audio track.",
     "Edits go through the open editor window: they appear live, use the app's undo history and save like Cmd+S.",
-    "Exports render the open editor's live project (the saved project when no editor has it open; export results say which) through the local QA render destination to avoid a save dialog, then move the file to the requested destination. No sharing or upload.",
+    "Exports support MP4 (H.264, HEVC, or both), ProRes (.mov), and GIF via the local QA render destination without a save dialog, then move finished file(s) to the requested destination. No sharing or upload.",
   ],
 };

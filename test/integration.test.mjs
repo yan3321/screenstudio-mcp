@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { offlineTransport } from "./support/stdio.mjs";
 import { RECIPES, RECIPE_NAMES, recipeNotes, resolveRecipe, withBrand } from "../dist/studio/recipes.js";
 import { TARGETS, TARGET_NAMES, limitChecks, targetsForSpec } from "../dist/studio/deliver.js";
 import { capabilities } from "../dist/studio/compat.js";
@@ -99,11 +99,9 @@ test("a recipe's export spec sets frame rate on video targets and resolution on 
   assert.equal(ok.filter((c) => !c.ok).length, 0);
 });
 
-test("the server registers every tool status lists, with the cross-lane params", async () => {
+test("the server registers every tool status lists, with the cross-lane params", async (t) => {
   const client = new Client({ name: "integration", version: "1" });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: ["dist/mcp/main.js"], stderr: "pipe" }),
-  );
+  await client.connect(await offlineTransport(t));
   try {
     const { tools } = await client.listTools();
     for (const name of capabilities.tools)

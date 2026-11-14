@@ -20,7 +20,7 @@ const run = (time, afterWait = () => {}) => {
     "clearTimeout",
     previewSeekScript("/p", time),
   )(
-    { edit: () => c },
+    { observe: () => c },
     (fn, ms) => {
       if (ms === 700) {
         afterWait(c);

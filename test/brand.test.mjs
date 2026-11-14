@@ -18,6 +18,7 @@ import {
 } from "../dist/studio/brand.js";
 import { validateConfigChange } from "../dist/studio/project.js";
 import { configPartial } from "../dist/studio/editor/ops.js";
+import { register as registerBrand } from "../dist/mcp/tools/brand.js";
 
 // A project config shaped like Screen Studio 4's, with the groups a brand touches.
 const config = () => ({
@@ -217,4 +218,40 @@ test("the automatic text colour is chosen against the caption box, not the prima
   assert.equal(changes["captions.backgroundColor"], "#ffffff");
   assert.equal(changes["captions.color"], "#111111");
   assert.ok(!notes.some((n) => /Changed the caption box/.test(n)));
+});
+
+test("brand apply retains an unconfirmed save outcome and observation ID", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "ss-brand-save-outcome-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await saveBrand(dir, northwind);
+  let handler;
+  registerBrand(
+    {
+      registerTool: (_name, _schema, fn) => {
+        handler = fn;
+      },
+    },
+    {
+      studio: { stateDir: dir, appPath: join(dir, "absent.app") },
+      timeline: async () => ({ projectPath: "/owned.screenstudio", project: { config: config() } }),
+      editor: {
+        apply: async () => ({
+          checkpointId: "checkpoint",
+          saved: false,
+          saveOutcome: "unknown",
+          saveId: "save-id",
+        }),
+      },
+    },
+  );
+  const response = await handler(
+    { action: "apply", name: northwind.name, projectPath: "/owned.screenstudio", save: true, show: false },
+    {},
+  );
+  assert.equal(response.isError, undefined);
+  const applied = JSON.parse(response.content.at(-1).text);
+  assert.equal(applied.saved, false);
+  assert.equal(applied.saveOutcome, "unknown");
+  assert.equal(applied.saveId, "save-id");
+  assert.ok(applied.notes.some((note) => /save was not confirmed/.test(note)));
 });

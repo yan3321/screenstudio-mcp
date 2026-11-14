@@ -3,17 +3,42 @@
 // Cmd+S does. Nothing rewrites project files behind the editor's back.
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { CommandNotSentError } from "../../cdp/client.js";
 import type { Studio } from "../service.js";
 import { Desktop } from "../desktop.js";
-import { editorWindowTitle } from "../compat.js";
+import { APP_BUILD, editorWindowTitle } from "../compat.js";
 import { captureWindow, cropPng, exec } from "../media.js";
 import { readRecordingMeta } from "../recording.js";
 import { round } from "../timeline.js";
+import { assertProjectBundle, projectEditFingerprint } from "../project.js";
 import { assertUuid } from "../util.js";
 import { describeScene } from "./describe.js";
+import {
+  editProjectValue,
+  revisionFingerprint,
+  keyedEditRevisionFingerprint,
+  keyedRevisionFingerprint,
+  projectJSONValue,
+  publicSnapshot,
+  canonicalProjectJSON,
+} from "./revision.js";
+import type { KeyedRevisionFingerprint } from "./revision.js";
+import {
+  persistMutationReceipt,
+  readMutationReceipt,
+  readMutationIntent,
+  reserveMutationIntent,
+  sameRevisionFingerprint,
+  transactionScript,
+  unresolvedMutation,
+  RendererReceiptUnavailable,
+} from "./transaction.js";
+import type { MutationIntent, MutationReceipt, RendererReceipt } from "./transaction.js";
 import { prepareOps, type EditOp } from "./ops.js";
 import { PRELUDE, applyScript, previewSeekScript } from "./page.js";
+import type { SaveOutcome } from "./save.js";
+import { closeSavedScript, closeWithoutSaveScript } from "./save.js";
 const j = JSON.stringify;
 
 /** Size of the captured window or display, in the points mask bounds use. */
@@ -78,35 +103,186 @@ export class Editor {
 
   async open(projectPath: string) {
     const path = await this.studio.path(projectPath);
+    await assertProjectBundle(path);
     await this.studio.requireVersion("read");
-    const already = (await this.list()).some((e) => e.projectPath === path);
-    if (!already) {
-      await exec("/usr/bin/open", ["-a", this.studio.appPath, path], { timeout: 15000 });
-      for (let i = 0; i < 60; i++) {
-        await new Promise((r) => setTimeout(r, 250));
-        if ((await this.list()).some((e) => e.projectPath === path)) break;
+    await this.studio.projectLock(path, async () => {
+      const already = (await this.list()).some((e) => e.projectPath === path);
+      if (!already) {
+        await exec("/usr/bin/open", ["-a", this.studio.appPath, path], { timeout: 15000 });
+        for (let i = 0; i < 60; i++) {
+          await new Promise((r) => setTimeout(r, 250));
+          if ((await this.list()).some((e) => e.projectPath === path)) break;
+        }
       }
-    }
-    await this.run(
-      `const c = __ss.get(${j(path)}); try { c.view.targetWindow.focus(); } catch {} return true;`,
-    ).catch(() => {
-      throw new Error("Screen Studio did not open the project editor. Inspect the app before retrying.");
+      await this.run(
+        `const c = __ss.get(${j(path)}); try { c.view.targetWindow.focus(); } catch {} return true;`,
+      ).catch(() => {
+        throw new Error("Screen Studio did not open the project editor. Inspect the app before retrying.");
+      });
     });
     return this.state(path);
   }
 
+  async close(
+    projectPath: string,
+    options: { save?: boolean; expectedFingerprint?: KeyedRevisionFingerprint } = {},
+  ) {
+    const path = await this.studio.path(projectPath);
+    await assertProjectBundle(path);
+    const version = await this.studio.requireVersion("write");
+    return this.locked(path, async () => {
+      const open = (await this.list()).some((e) => e.projectPath === path);
+      if (!open) return { closed: false, alreadyClosed: true, projectPath: path };
+      if (options.save !== false) {
+        const saveId = randomUUID();
+        try {
+          await this.run(closeSavedScript(path, saveId), 60000);
+        } catch (error) {
+          throw Object.assign(
+            new Error(
+              `${error instanceof Error ? error.message : "Close save was not confirmed."} Close save requestId ${saveId}; retain this ID and inspect the live editor and save observation before continuing.`,
+              { cause: error },
+            ),
+            { saveId },
+          );
+        }
+      } else {
+        let expectedSha256: string | undefined;
+        if (options.expectedFingerprint) {
+          if (version !== APP_BUILD)
+            throw new Error("Fenced discard requires the tested Screen Studio build.");
+          const captured = await this.captureSnapshot(path);
+          const actual = await keyedEditRevisionFingerprint(
+            captured.project,
+            await this.studio.statePath("revision-integrity.key"),
+          );
+          if (!sameRevisionFingerprint(actual, options.expectedFingerprint))
+            throw new Error(
+              "The project changed since the discard snapshot; nothing was closed or discarded.",
+            );
+          expectedSha256 = createHash("sha256")
+            .update(canonicalProjectJSON(editProjectValue(captured.project)))
+            .digest("hex");
+        }
+        await this.run(closeWithoutSaveScript(path, expectedSha256));
+      }
+      for (let i = 0; i < 40; i++) {
+        if (!(await this.list()).some((e) => e.projectPath === path)) {
+          return { closed: true, projectPath: path, saved: options.save !== false };
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      throw new Error("Screen Studio editor window did not finish closing.");
+    });
+  }
+
   async raw(projectPath: string) {
     const path = await this.studio.path(projectPath);
-    return this.run<any>(`return __ss.summary(__ss.get(${j(path)}));`);
+    const { serializedProject, ...state } = await this.run<any>(
+      `const c = __ss.get(${j(path)}); const serializedProject = c.project.serialize(); const { scenes, config, ...metadata } = __ss.summary(c, serializedProject); return { ...metadata, serializedProject };`,
+    );
+    return {
+      ...state,
+      scenes: serializedProject.scenes.map((scene: any) => ({
+        id: scene.id,
+        name: scene.name,
+        slices: scene.slices,
+        zooms: scene.zooms,
+        layouts: scene.layouts,
+        masks: scene.masks,
+        voiceOvers: scene.voiceOvers,
+      })),
+      config: serializedProject.config,
+      editFingerprint: projectEditFingerprint(serializedProject),
+    };
+  }
+
+  private async captureSnapshot(path: string) {
+    const appVersion = await this.studio.requireVersion("read");
+    const captured = await this.run<{
+      project: Record<string, unknown>;
+      editGeneration: number;
+      editRunning: boolean;
+      unsavedChanges: boolean;
+      sourceDurationMs: number;
+      writeQuarantine: { saveId: string; since: number; instanceId?: string; phase: string } | null;
+      rendererInstanceId: string;
+    }>(`
+      const c = __ss.get(${j(path)});
+      const projectJSONValue = ${projectJSONValue.toString()};
+      const project = projectJSONValue(c.project.serialize());
+      return { project, editGeneration: c.project.editGeneration,
+        editRunning: !!__ss.busy()[${j(path)}], unsavedChanges: c.project.isDirty,
+        writeQuarantine: __ss.pendingWrite(${j(path)}),
+        rendererInstanceId: __ss.instanceId,
+        sourceDurationMs: c.project.sourceDurationMs };
+    `);
+    if (
+      !captured ||
+      typeof appVersion !== "string" ||
+      !appVersion ||
+      !Number.isInteger(captured.editGeneration) ||
+      captured.editGeneration < 0 ||
+      typeof captured.unsavedChanges !== "boolean" ||
+      typeof captured.editRunning !== "boolean" ||
+      !captured.project ||
+      !Array.isArray(captured.project.scenes) ||
+      !captured.project.config ||
+      typeof captured.project.config !== "object" ||
+      Array.isArray(captured.project.config) ||
+      typeof captured.project.version !== "string" ||
+      !captured.project.version
+    ) {
+      throw new Error("Native snapshot shape is unsupported; no revision fence was issued.");
+    }
+    return { ...captured, appVersion };
+  }
+
+  async snapshot(projectPath: string) {
+    const path = await this.studio.path(projectPath);
+    const captured = await this.captureSnapshot(path);
+    const { appVersion } = captured;
+    const projection = publicSnapshot(captured.project);
+    const revisionBasis = appVersion === APP_BUILD ? "native-edit" : "serialized-content";
+    const fingerprint = await (
+      revisionBasis === "native-edit" ? keyedEditRevisionFingerprint : keyedRevisionFingerprint
+    )(captured.project, await this.studio.statePath("revision-integrity.key"));
+    const legacyExportFence = projection.redactedPaths.length
+      ? { status: "unavailable" as const, reason: "redacted-private-settings" }
+      : { status: "available" as const, editFingerprint: projectEditFingerprint(captured.project) };
+    return {
+      snapshotVersion: 1,
+      appVersion,
+      schema: captured.project.version,
+      projectPath: path,
+      editGeneration: captured.editGeneration,
+      editRunning: captured.editRunning,
+      writeQuarantine: captured.writeQuarantine,
+      rendererInstanceId: captured.rendererInstanceId,
+      unsavedChanges: captured.unsavedChanges,
+      revisionFingerprint: fingerprint,
+      revisionBasis,
+      legacyExportFence,
+      ...projection,
+    };
   }
 
   async state(projectPath: string) {
-    const s = await this.raw(projectPath);
+    return this.describeState(await this.raw(projectPath));
+  }
+
+  async stateWithConfig(projectPath: string) {
+    const captured = await this.raw(projectPath);
+    return { ...this.describeState(captured), config: captured.config };
+  }
+
+  private describeState(s: Awaited<ReturnType<Editor["raw"]>>) {
     return {
       projectPath: s.projectPath,
       name: s.name,
       unsavedChanges: s.dirty,
       editGeneration: s.editGeneration,
+      editFingerprint: s.editFingerprint,
       playheadMs: round(s.playheadMs),
       playing: s.playing,
       playbackDurationMs: round(s.playbackDurationMs),
@@ -114,6 +290,7 @@ export class Editor {
       canUndo: s.canUndo,
       canRedo: s.canRedo,
       editRunning: s.editRunning,
+      writeQuarantine: s.writeQuarantine,
       scenes: s.scenes.map((sc: any) => ({
         id: sc.id,
         name: sc.name,
@@ -152,9 +329,323 @@ export class Editor {
     if (!(await this.studio.isRunning())) return null;
     return this.run(
       `const c = __ss.contexts().find((c) => c.project.path === ${j(projectPath)});
-       if (c && __ss.busy()[c.project.path]) throw new Error('An edit is still being applied to this project; try again when it finishes.');
+       if (c) __ss.observe(c.project.path);
        return c ? c.project.serialize() : null;`,
     );
+  }
+
+  async requireEditable(projectPath: string) {
+    const path = await this.studio.path(projectPath);
+    await this.studio.requireVersion();
+    await this.run(`__ss.edit(${j(path)}); return true;`);
+  }
+
+  async saveObservation(projectPath: string, saveId: string, expectedInstanceId?: string) {
+    saveId = saveId.toLowerCase();
+    assertUuid(saveId, "Invalid save ID.");
+    const path = await this.studio.path(projectPath);
+    await this.studio.requireVersion("read");
+    return this.run(`
+      const saved = window.__ssmcpPendingWrites?.[${j(saveId.toLowerCase())}];
+      const instanceId = window.__ssmcpRendererInstance ?? null;
+      const replacement = ${j(expectedInstanceId) ?? "undefined"} === undefined ? {} : { rendererReplaced: instanceId !== ${j(expectedInstanceId) ?? "undefined"} };
+      if (!saved) return { found: false, reason: 'observationAbsent', instanceId, ...replacement };
+      if (saved.projectPath !== ${j(path)}) throw new Error('Save ID belongs to another project.');
+      return { found: true, instanceId, ...replacement, observation: {
+        saveId: saved.saveId, projectPath: saved.projectPath, instanceId: saved.instanceId,
+        phase: saved.phase, startedAtMs: saved.startedAtMs, settledAtMs: saved.settledAtMs,
+        cleanMarked: saved.cleanMarked, diverged: saved.diverged, dispatchThrew: saved.dispatchThrew,
+        saveReason: saved.saveReason
+      } };
+    `);
+  }
+
+  private async mutationReceiptNow(path: string, mutationId: string): Promise<MutationReceipt | null> {
+    const file = await this.studio.statePath(`mutation-${mutationId}.json`);
+    let receipt = await readMutationReceipt(file);
+    let fromDisk = !!receipt;
+    if (!receipt) {
+      const raw = await this.studio
+        .requireVersion("read")
+        .then(() =>
+          this.run<RendererReceipt | null>(
+            `return window.__ssmcpRevisionReceipts?.[${j(mutationId)}] ?? null;`,
+          ),
+        )
+        .catch(() => {
+          throw new RendererReceiptUnavailable(
+            "The renderer could not be queried; retry receipt lookup without dispatching another edit.",
+          );
+        });
+      if (!raw) return null;
+      if (raw.persisted) {
+        if (raw.projectPath !== path || raw.mutationId !== mutationId)
+          throw new Error("Mutation ID belongs to another project; no edit was retried.");
+        receipt = await readMutationReceipt(file);
+        if (!receipt)
+          throw new Error(
+            "The renderer acknowledged this mutation, but its durable receipt is missing from this SDK state directory. Use its originating state or reconcile the missing evidence.",
+          );
+        fromDisk = true;
+      } else {
+        const keyPath = await this.studio.statePath("revision-integrity.key");
+        const beforeFingerprint = raw.before
+          ? await keyedEditRevisionFingerprint(raw.before, keyPath)
+          : undefined;
+        receipt = {
+          receiptVersion: 1,
+          mutationId: raw.mutationId,
+          projectPath: raw.projectPath,
+          requestFingerprint: raw.requestFingerprint,
+          phase: raw.phase,
+          ...(raw.status ? { status: raw.status } : {}),
+          ...(raw.reason ? { reason: raw.reason } : {}),
+          ...(beforeFingerprint ? { beforeFingerprint } : {}),
+          ...(raw.beforeGeneration !== undefined ? { beforeGeneration: raw.beforeGeneration } : {}),
+          ...(raw.after ? { afterFingerprint: await keyedEditRevisionFingerprint(raw.after, keyPath) } : {}),
+          ...(raw.afterGeneration !== undefined ? { afterGeneration: raw.afterGeneration } : {}),
+          ...(raw.results ? { results: raw.results } : {}),
+          ...(raw.failedAt !== undefined ? { failedAt: raw.failedAt } : {}),
+          ...(raw.saved !== undefined ? { saved: raw.saved } : {}),
+          ...(raw.saveFailed ? { saveFailed: true } : {}),
+          ...(raw.saveOutcome ? { saveOutcome: raw.saveOutcome } : {}),
+          ...(raw.saveReason ? { saveReason: raw.saveReason } : {}),
+          ...(raw.saveId ? { saveId: raw.saveId } : {}),
+          ...(raw.instanceId ? { instanceId: raw.instanceId } : {}),
+          ...(raw.startedAtMs !== undefined ? { startedAtMs: raw.startedAtMs } : {}),
+          ...(raw.errorCode ? { errorCode: raw.errorCode } : {}),
+        };
+      }
+    }
+    if (receipt.projectPath !== path || receipt.mutationId !== mutationId)
+      throw new Error("Mutation ID belongs to another project; no edit was retried.");
+    const authority = await keyedRevisionFingerprint(
+      { purpose: "revision-authority" },
+      await this.studio.statePath("revision-integrity.key"),
+    );
+    const requestAuthority = JSON.parse(receipt.requestFingerprint).keyId;
+    if (
+      requestAuthority !== authority.keyId ||
+      (receipt.beforeFingerprint && receipt.beforeFingerprint.keyId !== authority.keyId)
+    )
+      throw new Error("Mutation receipt uses a different integrity authority; reconcile before continuing.");
+    if (!fromDisk) {
+      await persistMutationReceipt(file, receipt);
+      await this.compactReceipt(receipt);
+    }
+    return receipt;
+  }
+
+  private async compactReceipt(receipt: MutationReceipt) {
+    const mutationId = receipt.mutationId;
+    if (receipt.phase === "complete")
+      await this.run(
+        `
+        const r = window.__ssmcpRevisionReceipts?.[${j(mutationId)}];
+        if (r && r.phase === 'complete' && r.requestFingerprint === ${j(receipt.requestFingerprint)}) {
+          window.__ssmcpRevisionReceipts[${j(mutationId)}] = {
+            receiptVersion: 1, mutationId: r.mutationId, projectPath: r.projectPath,
+            requestFingerprint: r.requestFingerprint, phase: 'complete', persisted: true
+          };
+        }
+        return true;
+      `,
+      ).catch(() => {});
+  }
+
+  async recoverMutationReceipts() {
+    if (!(await this.studio.isRunning())) return { recovered: 0 };
+    const candidates = await this.run<
+      Array<{ mutationId: string; projectPath: string; requestFingerprint: string }>
+    >(`
+      return Object.values(window.__ssmcpRevisionReceipts ?? {})
+        .filter(r => r.phase === 'complete' && !r.persisted)
+        .map(r => ({ mutationId: r.mutationId, projectPath: r.projectPath, requestFingerprint: r.requestFingerprint }));
+    `);
+    let recovered = 0;
+    for (const candidate of candidates) {
+      const intent = await readMutationIntent(
+        await this.studio.statePath(`mutation-${candidate.mutationId}.intent.json`),
+      );
+      if (!intent || intent.requestFingerprint !== candidate.requestFingerprint) continue;
+      await this.assertMutationIntent(candidate.projectPath, candidate.mutationId, intent);
+      const receipt = await this.mutationReceiptNow(candidate.projectPath, candidate.mutationId);
+      if (receipt?.phase === "complete") {
+        await this.compactReceipt(receipt);
+        recovered++;
+      }
+    }
+    return { recovered };
+  }
+
+  private async assertMutationIntent(path: string, mutationId: string, intent: MutationIntent) {
+    if (intent.projectPath !== path || intent.mutationId !== mutationId)
+      throw new Error("Mutation ID belongs to another project; no edit was retried.");
+    const authority = await keyedRevisionFingerprint(
+      { purpose: "revision-authority" },
+      await this.studio.statePath("revision-integrity.key"),
+    );
+    if (JSON.parse(intent.requestFingerprint).keyId !== authority.keyId)
+      throw new Error("Mutation intent uses a different integrity authority; reconcile before continuing.");
+  }
+
+  async mutationReceipt(projectPath: string, mutationId: string) {
+    mutationId = mutationId.toLowerCase();
+    assertUuid(mutationId, "Invalid mutation ID.");
+    const path = await this.studio.path(projectPath);
+    const intent = await readMutationIntent(
+      await this.studio.statePath(`mutation-${mutationId}.intent.json`),
+    );
+    if (intent) await this.assertMutationIntent(path, mutationId, intent);
+    let receipt;
+    try {
+      receipt = await this.mutationReceiptNow(path, mutationId);
+    } catch (error) {
+      if (!(error instanceof RendererReceiptUnavailable)) throw error;
+      return intent
+        ? { found: true as const, receipt: unresolvedMutation(intent, "rendererUnavailable") }
+        : { found: false as const, reason: "rendererUnavailable" as const, retryable: true };
+    }
+    if (receipt) return { found: true as const, receipt };
+    return intent
+      ? { found: true as const, receipt: unresolvedMutation(intent) }
+      : { found: false as const, reason: "receiptAbsent" as const, retryable: false };
+  }
+
+  async applyRevision(
+    projectPath: string,
+    sceneId: string | undefined,
+    ops: EditOp[],
+    options: { mutationId: string; expectedFingerprint: KeyedRevisionFingerprint; save: boolean },
+  ) {
+    options = { ...options, mutationId: options.mutationId.toLowerCase() };
+    if (!ops.length && !options.save) throw new Error("An empty revision batch requires save:true.");
+    assertUuid(options.mutationId, "Invalid mutation ID.");
+    const path = await this.studio.path(projectPath);
+    return this.locked(path, async () => {
+      const keyPath = await this.studio.statePath("revision-integrity.key");
+      const requestFingerprint = j(
+        await keyedRevisionFingerprint(
+          {
+            purpose: "native-mutation-request",
+            projectPath: path,
+            sceneId: sceneId ?? null,
+            ops,
+            expectedFingerprint: options.expectedFingerprint,
+            save: options.save,
+          },
+          keyPath,
+        ),
+      );
+      const intentPath = await this.studio.statePath(`mutation-${options.mutationId}.intent.json`);
+      const intent = await readMutationIntent(intentPath);
+      if (intent) {
+        await this.assertMutationIntent(path, options.mutationId, intent);
+        if (intent.requestFingerprint !== requestFingerprint)
+          throw new Error("Mutation ID already belongs to a different request; nothing was retried.");
+      }
+      let previous;
+      try {
+        previous = await this.mutationReceiptNow(path, options.mutationId);
+      } catch (error) {
+        if (!(error instanceof RendererReceiptUnavailable) || !intent) throw error;
+        return unresolvedMutation(intent, "rendererUnavailable");
+      }
+      if (previous) {
+        if (previous.requestFingerprint !== requestFingerprint)
+          throw new Error("Mutation ID already belongs to a different request; nothing was retried.");
+        return previous;
+      }
+      if (intent) return unresolvedMutation(intent);
+      if ((await this.studio.requireVersion("write")) !== APP_BUILD)
+        throw new Error(
+          "Native revision mutations require the tested Screen Studio build; no intent was reserved.",
+        );
+      const before = await this.captureSnapshot(path);
+      if (before.writeQuarantine)
+        throw new Error(
+          "This project has an unresolved native save; no new mutation intent was reserved. Inspect its save observation before editing.",
+        );
+      const fingerprint = await keyedEditRevisionFingerprint(before.project, keyPath);
+      const matches = sameRevisionFingerprint(fingerprint, options.expectedFingerprint);
+      const scenes = before.project.scenes as Array<{
+        id: string;
+        slices: Array<{ sourceEndMs: number }>;
+        zooms: Array<{ id: string; sourceStartMs: number; sourceEndMs: number }>;
+        layouts: Array<{ id: string; sourceStartMs: number; sourceEndMs: number }>;
+        masks: Array<{ id: string; sourceStartMs: number; sourceEndMs: number }>;
+      }>;
+      const scene = sceneId ? scenes.find((scene) => scene.id === sceneId) : scenes[0];
+      let prepared: ReturnType<typeof prepareOps> = [];
+      if (matches && !before.editRunning) {
+        if (!scene) throw new Error("Scene does not exist; no mutation was submitted.");
+        prepared = prepareOps(ops, {
+          sourceMs: Math.max(before.sourceDurationMs, ...scene.slices.map((slice) => slice.sourceEndMs)),
+          config: before.project.config,
+          captureSize: await captureSize(path),
+          tracks: { zooms: scene.zooms, layouts: scene.layouts, masks: scene.masks },
+        });
+      }
+      const reservation: MutationIntent = {
+        intentVersion: 1,
+        mutationId: options.mutationId,
+        projectPath: path,
+        requestFingerprint,
+        expectedFingerprint: options.expectedFingerprint,
+      };
+      if (!(await reserveMutationIntent(intentPath, reservation))) {
+        return (await this.mutationReceiptNow(path, options.mutationId)) ?? unresolvedMutation(reservation);
+      }
+      if (before.editRunning) {
+        const refused: MutationReceipt = {
+          receiptVersion: 1,
+          mutationId: options.mutationId,
+          projectPath: path,
+          requestFingerprint,
+          phase: "complete",
+          status: "notApplied",
+          reason: "editorBusy",
+          beforeFingerprint: fingerprint,
+          beforeGeneration: before.editGeneration,
+        };
+        await persistMutationReceipt(
+          await this.studio.statePath(`mutation-${options.mutationId}.json`),
+          refused,
+        );
+        return refused;
+      }
+      try {
+        await this.run(
+          transactionScript(path, scene?.id ?? "", prepared, {
+            mutationId: options.mutationId,
+            requestFingerprint,
+            expectedSha256: matches ? revisionFingerprint(editProjectValue(before.project)).sha256 : "",
+            save: options.save,
+          }),
+          120000,
+        );
+      } catch (error) {
+        if (!(error instanceof CommandNotSentError)) throw error;
+        const refused: MutationReceipt = {
+          receiptVersion: 1,
+          mutationId: options.mutationId,
+          projectPath: path,
+          requestFingerprint,
+          phase: "complete",
+          status: "notApplied",
+          reason: "notDispatched",
+        };
+        await persistMutationReceipt(
+          await this.studio.statePath(`mutation-${options.mutationId}.json`),
+          refused,
+        );
+        return refused;
+      }
+      const receipt = await this.mutationReceiptNow(path, options.mutationId);
+      if (!receipt)
+        throw new Error("Mutation outcome is unknown; look up the same mutation ID before continuing.");
+      return receipt;
+    });
   }
 
   /**
@@ -172,6 +663,7 @@ export class Editor {
     const path = await this.studio.path(projectPath);
     await this.studio.requireVersion();
     return this.locked(path, async () => {
+      await this.requireEditable(path);
       const before = await this.raw(path);
       if (options.expectedGeneration !== undefined && options.expectedGeneration !== before.editGeneration)
         throw new Error(
@@ -205,12 +697,14 @@ export class Editor {
       let run: { results: any[]; failedAt?: number; error?: string };
       // Cancelling stops the batch between ops; the checkpoint still undoes what ran.
       const cancel = () => {
-        this.run(`const b = __ss.busy()[${j(path)}]; if (b) b.cancel = true; return true;`).catch(() => {});
+        this.run(
+          `const b = __ss.busy()[${j(path)}]; if (b?.kind === 'edit' && b.checkpointId === ${j(checkpointId)}) b.cancel = true; return true;`,
+        ).catch(() => {});
       };
       options.signal?.addEventListener("abort", cancel, { once: true });
       try {
         run = await this.run(
-          applyScript(path, scene.id, prepared, show, before.editGeneration),
+          applyScript(path, scene.id, prepared, show, before.editGeneration, false, checkpointId),
           show ? 600000 : 30000,
         );
       } catch (e) {
@@ -224,8 +718,8 @@ export class Editor {
       }
       if (run.failedAt === undefined) {
         // Saved inside the same lock, so no other call's edit lands between apply and save.
-        if (options.save) await this.saveNow(path);
-        return { results: run.results, checkpointId, ...(options.save ? { saved: true } : {}) };
+        const saved = options.save ? await this.saveNow(path) : undefined;
+        return { results: run.results, checkpointId, ...saved };
       }
       return {
         partial: true,
@@ -284,21 +778,44 @@ export class Editor {
   async save(projectPath: string) {
     const path = await this.studio.path(projectPath);
     await this.studio.requireVersion();
-    return this.locked(path, () => this.saveNow(path));
+    return this.locked(path, async () => {
+      await this.requireEditable(path);
+      return this.saveNow(path);
+    });
   }
 
   /** Same steps as the editor's own save: serialize, write through the app, mark saved. Caller holds the lock. */
-  private saveNow(path: string) {
-    return this.run(
-      `
-      const p = __ss.edit(${j(path)}).project;
+  private async saveNow(path: string, saveId = randomUUID()): Promise<SaveOutcome> {
+    try {
+      return await this.run<SaveOutcome>(
+        `
+      let c;
+      try { c = __ss.edit(${j(path)}); }
+      catch { return { saved: false, saveOutcome: 'notSent', saveReason: 'rendererRefused', writeQuarantine: __ss.pendingWrite(${j(path)}) }; }
+      const p = c.project;
       const generation = p.editGeneration;
-      await bridge.client.mutation('project.updateProject', { projectPath: p.path, data: p.serialize() });
-      p.markAsJustSaved(generation);
-      return { saved: true, unsavedChanges: p.isDirty };
+      const data = structuredClone(p.serialize());
+      const barrier = { since: Date.now(), kind: 'edit' };
+      __ss.busy()[${j(path)}] = barrier;
+      try { return await __ssSave(c, data, generation, barrier, ${j(saveId)}); }
+      catch { return { saved: false, saveOutcome: barrier.kind === 'pendingWrite' ? 'unknown' : 'notSent', saveReason: 'saveHelperFailed',
+        ...(barrier.kind === 'pendingWrite' ? { saveId: ${j(saveId)}, instanceId: window.__ssmcpRendererInstance,
+          startedAtMs: window.__ssmcpPendingWrites?.[${j(saveId)}]?.startedAtMs } : {}) }; }
+      finally {
+        if (__ss.busy()[${j(path)}] === barrier && barrier.kind !== 'pendingWrite')
+          delete __ss.busy()[${j(path)}];
+      }
     `,
-      60000,
-    );
+        60000,
+      );
+    } catch (error) {
+      return {
+        saved: false,
+        saveOutcome: error instanceof CommandNotSentError ? "notSent" : "unknown",
+        saveReason: "saveCallFailed",
+        saveId,
+      };
+    }
   }
 
   async seek(projectPath: string, at: { playbackMs?: number; sourceMs?: number }) {
@@ -346,7 +863,7 @@ export class Editor {
   private async frameWindow(path: string) {
     const tag = `ssmcp-${randomUUID().slice(0, 8)}`;
     const info = await this.run<any>(`
-      const c = __ss.edit(${j(path)});
+      const c = __ss.observe(${j(path)});
       const w = c.view.targetWindow;
       // The preview draws at the display's pixel ratio; panel backdrops are canvases
       // too, drawn at 1x, and can be larger than the preview in a small window.
@@ -385,7 +902,7 @@ export class Editor {
     try {
       await captureWindow(window.windowId, full);
       await this.run(`
-        const c = __ss.edit(${j(path)});
+        const c = __ss.observe(${j(path)});
         if (Math.abs(c.playback.playbackTimeMs - ${playheadMs}) > 1 || c.project.editGeneration !== ${editGeneration})
           throw new Error('The playhead or project changed during capture. Inspect the current editor before requesting another frame.');
         return true;
@@ -419,11 +936,15 @@ export class Editor {
       timeline?: boolean;
       previewOnly?: boolean;
       close?: boolean;
+      cropWindow?: boolean;
+      lutStudio?: boolean;
+      shortcutsGuide?: boolean;
     },
   ) {
     const path = await this.studio.path(projectPath);
-    return this.locked(path, () =>
-      this.run(`
+    return this.locked(path, async () => {
+      await this.studio.requireVersion();
+      return this.run(`
       const c = __ss.edit(${j(path)}); const view = c.view; const v = ${j(v)};
       if (v.panel) view.setSidebarRoot(v.panel);
       if (v.select) { const kind = { zooms: ['zoom', 'zoomId'], masks: ['mask', 'maskId'], layouts: ['layout', 'layoutId'], slices: ['slice', 'sliceId'] }[v.select.track]; if (!kind) throw new Error('Unknown track ' + v.select.track); view.setSidebarItem({ type: kind[0], [kind[1]]: v.select.id }); }
@@ -432,17 +953,35 @@ export class Editor {
       if (v.sidebar !== undefined && view.shouldShowSidebar !== v.sidebar) view.toggleSidebar();
       if (v.timeline !== undefined && view.shouldShowTimeline !== v.timeline) view.toggleTimeline();
       if (v.previewOnly !== undefined) { const only = !view.shouldShowSidebar && !view.shouldShowTimeline; if (only !== v.previewOnly) view.togglePreview(); }
+      if (v.cropWindow !== undefined) view.isCropWindowOpen = v.cropWindow;
+      if (v.lutStudio !== undefined) view.isLutStudioWindowOpen = v.lutStudio;
+      if (v.shortcutsGuide !== undefined) view.isShortcutsGuideVisible = v.shortcutsGuide;
       await new Promise((r) => setTimeout(r, 600));
-      return { panel: view.sidebarRoot, item: view.sidebarItem, timelineMs: Math.round(view.pendingVisiblePlaybackDurationMs ?? view.visiblePlaybackDurationMs), sidebar: view.shouldShowSidebar, timeline: view.shouldShowTimeline };
-    `),
-    );
+      return {
+        panel: view.sidebarRoot,
+        item: view.sidebarItem,
+        timelineMs: Math.round(view.pendingVisiblePlaybackDurationMs ?? view.visiblePlaybackDurationMs),
+        sidebar: view.shouldShowSidebar,
+        timeline: view.shouldShowTimeline,
+        cropWindow: !!view.isCropWindowOpen,
+        lutStudio: !!view.isLutStudioWindowOpen,
+        shortcutsGuide: !!view.isShortcutsGuideVisible,
+      };
+    `);
+    });
+  }
+
+  /** Updates top-level projectConfig groups live inside the open editor (respecting lock & undo). */
+  async updateConfig(projectPath: string, partial: Record<string, unknown>) {
+    const path = await this.studio.path(projectPath);
+    return this.locked(path, async () => {
+      await this.studio.requireVersion();
+      return this.run(`__ss.edit(${j(path)}).project.projectConfig.update(${j(partial)}); return true;`);
+    });
   }
 
   /** Sets the project's audio track settings in the editor (used by narration). */
   async setAudio(projectPath: string, audio: Record<string, unknown>) {
-    const path = await this.studio.path(projectPath);
-    return this.locked(path, () =>
-      this.run(`__ss.edit(${j(path)}).project.projectConfig.update({ audio: ${j(audio)} }); return true;`),
-    );
+    return this.updateConfig(projectPath, { audio });
   }
 }

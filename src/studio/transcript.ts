@@ -69,7 +69,7 @@ const firstLine = (e: any) => String(e?.message ?? e).split("\n")[0];
 
 const staleEditor = (cause: string) =>
   new Error(
-    `Transcript saved, but the open editor could not reload it (${cause}). Supported build: ${APP_BUILD}. Close and reopen the project before touching captions in the app.`,
+    `Transcript saved, but the open editor could not reload it (${cause}). Supported build: ${APP_BUILD}. Close and reopen the project before touching captions in the app. Use screenstudio_transcript_read to read the saved words without regenerating.`,
   );
 
 /**
@@ -77,15 +77,19 @@ const staleEditor = (cause: string) =>
  * The model reads `transcriptPromise.data`, which only the bridge's MobxPromise
  * has; the raw tRPC client returns a plain Promise and blanks the captions.
  */
-async function refreshEditor(studio: Studio, projectPath: string): Promise<EditorSync> {
+async function refreshEditor(
+  studio: Studio,
+  projectPath: string,
+  { allowEmpty = false }: { allowEmpty?: boolean } = {},
+): Promise<EditorSync> {
   const state = await studio
     .evaluate<EditorSync | "empty">(
       `${editorModel(studio, projectPath)}
        if (!m) return 'not-open';
        const q = bridge.query('captions.getTranscript', { projectPath: p.path });
        m.transcriptPromise = q; m.dirtyTranscript = null;
-       await q.promise.catch(() => {});
-       return m.transcriptData ? 'updated' : 'empty';`,
+       await q.promise;
+       return m.transcriptData || ${j(allowEmpty)} ? 'updated' : 'empty';`,
     )
     .catch((e) => {
       throw staleEditor(firstLine(e));
@@ -227,8 +231,15 @@ export async function generateTranscript(
   await studio.requireVersion();
   await studio.call("mutation", "captions.generateAll", { projectPath, generator }, 600000);
   await rm(join(studio.stateDir, removedFile(projectPath)), { force: true });
-  const editor = await refreshEditor(studio, projectPath);
-  return { ...(await readTranscript(studio, projectPath)), editor };
+  const read = await readTranscript(studio, projectPath);
+  const editor = await refreshEditor(studio, projectPath, { allowEmpty: !read.sessions.length });
+  if (!read.sessions.length)
+    return {
+      ...read,
+      editor,
+      note: "No microphone audio was found to transcribe.",
+    };
+  return { ...read, editor };
 }
 
 /**
