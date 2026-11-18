@@ -8,6 +8,7 @@ New releases go at the top.
 - **Your own defaults.** Before recording or editing, the skill reads `~/.screenstudio-mcp/preferences.md` (in `SCREENSTUDIO_STATE_DIR` when set) if it exists: editing taste, pacing, narration voice and settings, credit rules. Its preferences override the skill's defaults.
 - **Installer.** `install` and `update` put the skill in Claude Code's skills folder and, for Codex, in `~/.agents/skills` (`$CODEX_HOME/skills` is deprecated). They remove the three old skill folders from Claude Code, `$CODEX_HOME/skills` and `~/.agents/skills`, but only folders the installer made: a copy with its marker, or a symlink to a screenstudio-mcp checkout's own skill folder. `uninstall` removes the new and old folders. `--agents-home` points at a folder other than `~/.agents`; with `--claude-home` or `--codex-home` and no `--agents-home`, the real `~/.agents` is left alone.
 - **One narration order.** The record, edit and narration guides now match the skill: write the script and voice it with `screenstudio_voice_lines` before recording, then pin the voiced lines with `screenstudio_narrate` after the edit.
+- **Fewer false "you moved the mouse" stops.** On a busy machine the window server can apply a posted pointer move a few milliseconds late, and a recording stopped as if a person had moved the mouse. The helper now waits up to 150 ms for the pointer to arrive before it decides that.
 
 ## 0.5.4 (2026-10-03)
 

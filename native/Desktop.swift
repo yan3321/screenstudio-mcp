@@ -227,11 +227,17 @@ let defaultPace = Double(ProcessInfo.processInfo.environment["SCREENSTUDIO_PACE"
 // Where this helper last put the pointer. If the pointer is somewhere else
 // before the next step, the person moved the mouse: stop and hand it back.
 var lastPointer: CGPoint? = nil
+// On a busy machine the window server applies a posted move a few milliseconds late, so a
+// mid-glide read can trail the last posted point by more than the tolerance. Give it 150 ms to
+// catch up before deciding a person moved it.
 func checkPointerUnmoved() throws {
-  guard let last = lastPointer, let now = CGEvent(source: nil)?.location else { return }
-  if hypot(now.x - last.x, now.y - last.y) > 12 {
-    throw DesktopError("Stopped: you moved the mouse. Inspect again to continue.")
+  guard let last = lastPointer else { return }
+  for _ in 0..<30 {
+    guard let now = CGEvent(source: nil)?.location else { return }
+    if hypot(now.x - last.x, now.y - last.y) <= 12 { return }
+    usleep(5000)
   }
+  throw DesktopError("Stopped: you moved the mouse. Inspect again to continue.")
 }
 
 func post(_ event: CGEvent?) throws {
